@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.11"
+SCRIPT_VERSION="1.0.13"
 DEFAULT_REPO_URL="https://github.com/Eric-Gurt/StarDefenders2D.git"
 DEFAULT_BRANCH="main"
 DEFAULT_SERVICE_NAME="stardefenders"
@@ -542,6 +542,10 @@ initialize_git_metadata_for_existing_directory() {
 
   info "Initializing Git metadata in existing directory ${APP_DIR}"
   chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}"
+  if [[ -e "${APP_DIR}/.git" && ! -d "${APP_DIR}/.git" ]]; then
+    warn "Removing stale .git file before initializing Git metadata. A copy was preserved in installerbackup."
+    rm -f "${APP_DIR}/.git"
+  fi
   run_as_app git -C "${APP_DIR}" init
   add_local_git_excludes_for_server_runtime
   run_as_app git -C "${APP_DIR}" check-ref-format --branch "${REPO_BRANCH}" >/dev/null
@@ -926,11 +930,7 @@ EOF
     INSTALL_CERT_RENEWAL_HOOK="no"
   fi
 
-  if prompt_yes_no "Write an uninstall helper for this service" "${WRITE_UNINSTALL_HELPER:-y}"; then
-    WRITE_UNINSTALL_HELPER="yes"
-  else
-    WRITE_UNINSTALL_HELPER="no"
-  fi
+  WRITE_UNINSTALL_HELPER="yes"
 
   if prompt_yes_no "Start/restart the game service after installing units" "${RUN_INITIAL_UPDATE:-y}"; then
     RUN_INITIAL_UPDATE="yes"
@@ -1012,7 +1012,7 @@ Configuration summary:
   Crash loop: ${CRASH_LIMIT} failure(s) / ${CRASH_WINDOW_SEC}s, restart delay ${CRASH_RESTART_SEC}s
   Crash reports: keep ${CRASH_REPORT_KEEP}, delete older than ${CRASH_REPORT_RETENTION_DAYS} day(s)
   Cert renewal hook: ${INSTALL_CERT_RENEWAL_HOOK}
-  Uninstall helper: ${WRITE_UNINSTALL_HELPER}
+  Uninstall helper: mandatory
   Dry run: ${DRY_RUN}
 
 EOF
@@ -1037,6 +1037,10 @@ prepare_checkout() {
   fi
 
   prepare_existing_non_git_directory
+
+  if [[ "${EXISTING_NON_GIT_ACTION}" == "plain" ]]; then
+    return 0
+  fi
 
   if [[ -d "${APP_DIR}/.git" ]]; then
     info "Using existing Git checkout at ${APP_DIR}"
@@ -1912,7 +1916,6 @@ EOF
 
 write_uninstall_helper() {
   local path="${APP_DIR}/${SERVICE_NAME}-uninstall.sh"
-  [[ "${WRITE_UNINSTALL_HELPER}" == "yes" ]] || return 0
   install -d -o "${APP_USER}" -g "${APP_GROUP}" "${APP_DIR}"
   info "Writing ${path}"
   cat > "${path}" <<EOF
@@ -2139,7 +2142,7 @@ Generated files:
   /etc/systemd/system/${SERVICE_NAME}-config-restart.service
   /etc/systemd/system/${SERVICE_NAME}-config-watch.path
   ${APP_DIR}/${SERVICE_NAME}-admin-commands.txt
-  ${APP_DIR}/${SERVICE_NAME}-uninstall.sh (if enabled)
+  ${APP_DIR}/${SERVICE_NAME}-uninstall.sh
   /etc/letsencrypt/renewal-hooks/deploy/${SERVICE_NAME}-restart.sh (if enabled)
 
 EOF
