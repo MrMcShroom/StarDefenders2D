@@ -1501,6 +1501,72 @@ EOF
   chmod 755 "${path}"
 }
 
+write_fixperms_script() {
+  local path="/usr/local/bin/${SERVICE_NAME}-fixperms.sh"
+  info "Writing ${path}"
+  cat > "${path}" <<'EOF'
+#!/usr/bin/env bash
+# Runs as root via the main service unit's "ExecStartPre=+" (the '+' prefix
+# forces root even though the service drops to User=). It guarantees the
+# unprivileged service user owns its writable world data BEFORE the server
+# starts. Without this, a world imported as root -- snapshot/chunks copied in
+# over scp/cp/tar, or restored from a backup -- stays root-owned, and the
+# User= service then hits EACCES on every chunk write/delete. The game ignores
+# those errors and discards the in-memory chunk, so the symptom is silent
+# chunk loss / world corruption rather than a clean crash.
+set -uo pipefail
+
+source "__ENV_FILE__"
+
+if [[ -z "${APP_USER:-}" || -z "${APP_GROUP:-}" || -z "${APP_DIR:-}" ]]; then
+  # Never block startup over a perms fixup; the server can still try to run.
+  echo "${SERVICE_NAME:-stardefenders}-fixperms: env not fully loaded; skipping ownership fix" >&2
+  exit 0
+fi
+
+suffix="${FILE_SUFFIX:-}"
+
+# 1) The app-dir node itself must be writable by the service user: the server
+#    creates the snapshot TEMP file directly in APP_DIR before renaming it into
+#    place, so a root-owned APP_DIR node would EACCES every snapshot save.
+#    (Non-recursive on purpose -- cheap, and we never want to chown the whole
+#    tree, e.g. the .git checkout, every boot.)
+chown "${APP_USER}:${APP_GROUP}" "${APP_DIR}" 2>/dev/null || true
+
+# 2) Ensure the dirs the server/run-wrapper must write exist and are owned.
+#    crash_reports is created by the run wrapper running AS the service user; if
+#    it pre-exists root-owned (e.g. copied in), the wrapper cannot write its log
+#    and the service fails to start.
+install -d -o "${APP_USER}" -g "${APP_GROUP}" -m 755 "${APP_DIR}/chunks${suffix}" 2>/dev/null || true
+install -d -o "${APP_USER}" -g "${APP_GROUP}" -m 755 "${APP_DIR}/crash_reports" 2>/dev/null || true
+
+# 3) Single-file world data -- cheap unconditional chown.
+for f in \
+  "${APP_DIR}/star_defenders_snapshot${suffix}.v" \
+  "${APP_DIR}/star_defenders_snapshot${suffix}.raw.v" \
+  "${APP_DIR}/moderation_data${suffix}.v"
+do
+  [[ -e "${f}" ]] || continue
+  chown "${APP_USER}:${APP_GROUP}" "${f}" 2>/dev/null || true
+done
+
+# 4) Potentially large directories -- only recurse + chown when something is NOT
+#    already owned by the service user, so we don't chown -R a huge chunk dir
+#    every boot.
+for d in "${APP_DIR}/chunks${suffix}" "${APP_DIR}/crash_reports"; do
+  [[ -d "${d}" ]] || continue
+  if find "${d}" \( -not -user "${APP_USER}" -o -not -group "${APP_GROUP}" \) -print -quit 2>/dev/null | grep -q .; then
+    echo "${SERVICE_NAME}-fixperms: correcting ownership of ${d} -> ${APP_USER}:${APP_GROUP}"
+    chown -R "${APP_USER}:${APP_GROUP}" "${d}" || echo "${SERVICE_NAME}-fixperms: WARNING chown failed for ${d}" >&2
+  fi
+done
+
+exit 0
+EOF
+  sed -i "s#__ENV_FILE__#/etc/default/${SERVICE_NAME}#g" "${path}"
+  chmod 755 "${path}"
+}
+
 write_deploy_script() {
   local path="/usr/local/bin/${SERVICE_NAME}-deploy.sh"
   info "Writing ${path}"
@@ -1572,6 +1638,18 @@ log "Update available: ${current_rev} -> ${target_rev}"
 log "Stopping ${SERVICE_NAME}.service gracefully..."
 systemctl stop "${SERVICE_NAME}.service"
 
+# From here the service is stopped. If any step below fails under `set -e`, make
+# sure we don't leave the server offline until the next timer / manual fix --
+# bring it back up on the way out (mirrors the backup script's restart guard).
+deploy_finished="no"
+restore_service_on_failure() {
+  if [[ "${deploy_finished}" != "yes" ]]; then
+    log "Deploy step failed; restarting ${SERVICE_NAME}.service to avoid leaving it offline."
+    systemctl start "${SERVICE_NAME}.service" || log "WARNING: failed to restart ${SERVICE_NAME}.service after a failed deploy."
+  fi
+}
+trap restore_service_on_failure EXIT
+
 log "Backing up world snapshot/chunks before update..."
 "/usr/local/bin/${SERVICE_NAME}-backup.sh" update --service-already-stopped
 purge_old_backups
@@ -1584,6 +1662,7 @@ run_app_shell "cd $(printf '%q' "${APP_DIR}"); ${prefix}npm install --omit=dev -
 
 log "Starting ${SERVICE_NAME}.service..."
 systemctl start "${SERVICE_NAME}.service"
+deploy_finished="yes"
 log "Deploy complete at $(run_as_app git rev-parse --short HEAD)."
 EOF
   sed -i "s#__ENV_FILE__#/etc/default/${SERVICE_NAME}#g" "${path}"
@@ -1770,6 +1849,7 @@ User=${APP_USER}
 Group=${APP_GROUP}
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=/etc/default/${SERVICE_NAME}
+ExecStartPre=+/usr/local/bin/${SERVICE_NAME}-fixperms.sh
 ExecStart=/usr/local/bin/${SERVICE_NAME}-run.sh
 KillSignal=SIGTERM
 TimeoutStopSec=300
@@ -1943,6 +2023,7 @@ rm -f \
   "/usr/local/bin/${SERVICE_NAME}-deploy.sh" \
   "/usr/local/bin/${SERVICE_NAME}-backup.sh" \
   "/usr/local/bin/${SERVICE_NAME}-config-restart.sh" \
+  "/usr/local/bin/${SERVICE_NAME}-fixperms.sh" \
   "/etc/default/${SERVICE_NAME}" \
   "/usr/local/bin/${SERVICE_NAME}-uninstall.sh" \
   "${APP_DIR}/${SERVICE_NAME}-admin-commands.txt" \
@@ -2134,6 +2215,7 @@ Generated files:
   /usr/local/bin/${SERVICE_NAME}-deploy.sh
   /usr/local/bin/${SERVICE_NAME}-backup.sh
   /usr/local/bin/${SERVICE_NAME}-config-restart.sh
+  /usr/local/bin/${SERVICE_NAME}-fixperms.sh
   /etc/systemd/system/${SERVICE_NAME}.service
   /etc/systemd/system/${SERVICE_NAME}-update.service
   /etc/systemd/system/${SERVICE_NAME}-update.timer
@@ -2180,6 +2262,7 @@ main() {
   write_backup_script
   write_deploy_script
   write_config_restart_script
+  write_fixperms_script
   write_systemd_units
   write_cert_renewal_hook
   write_uninstall_helper
