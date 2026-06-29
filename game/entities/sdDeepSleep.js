@@ -831,11 +831,21 @@ class sdDeepSleep extends sdEntity
 			{
 				fs.unlink( globalThis.chunks_folder + '/' + this._snapshots_filename, ( err )=>
 				{
-					if ( err )
-					trace( 'Tried deleting chunk file but it does not exist' + err );
+					if ( err && err.code !== 'ENOENT' )
+					{
+						// A real failure (e.g. EACCES on a mis-owned chunks dir): the
+						// file may still be on disk, so keep _file_exists=true and let
+						// the delete be retried rather than orphaning a file we wrongly
+						// believe is gone.
+						trace( 'Unable to delete chunk file: ' + err );
+						resolve();
+						return;
+					}
 
+					// unlink succeeded, or the file was already gone (ENOENT) - either
+					// way the chunk is no longer on disk.
 					this._file_exists = false;
-					
+
 					resolve();
 				});
 			}
@@ -859,10 +869,17 @@ class sdDeepSleep extends sdEntity
 			
 			if ( sdWorld.is_singleplayer )
 			{
-				fs.writeFile( globalThis.chunks_folder + '/' + this._snapshots_filename, this._snapshots_str, ( err )=> 
+				fs.writeFile( globalThis.chunks_folder + '/' + this._snapshots_filename, this._snapshots_str, ( err )=>
 				{
 					if ( err )
-					trace( 'Unable to save chunk data to final file: ' + err );
+					{
+						// Write failed: keep the data in memory and leave _file_exists
+						// false so SaveScheduledChunks retries on the next cycle, instead
+						// of discarding the chunk and falsely reporting it as saved.
+						trace( 'Unable to save chunk data to final file: ' + err );
+						resolve();
+						return;
+					}
 
 					this._file_exists = true;
 
@@ -875,15 +892,30 @@ class sdDeepSleep extends sdEntity
 			}
 			else
 			{
-				fs.writeFile( globalThis.chunks_folder + '/' + 'TEMP_' + this._snapshots_filename, this._snapshots_str, ( err )=> 
+				fs.writeFile( globalThis.chunks_folder + '/' + 'TEMP_' + this._snapshots_filename, this._snapshots_str, ( err )=>
 				{
 					if ( err )
-					trace( 'Unable to save chunk data to temp file: ' + err );
+					{
+						// Temp write failed (e.g. EACCES on a mis-owned chunks dir):
+						// there is nothing to rename. Keep the data in memory and leave
+						// _file_exists false so the save is retried next cycle rather
+						// than silently discarding the chunk.
+						trace( 'Unable to save chunk data to temp file: ' + err );
+						resolve();
+						return;
+					}
 
 					fs.rename( globalThis.chunks_folder + '/' + 'TEMP_' + this._snapshots_filename, globalThis.chunks_folder + '/' + this._snapshots_filename, ( err )=>
 					{
 						if ( err )
-						trace( 'Unable to rename TEMP chunk data file into proper snapshot file: ' + err );
+						{
+							// Rename failed: the real chunk file was not produced. Keep
+							// the in-memory data for a retry instead of discarding it and
+							// falsely marking the chunk as on-disk.
+							trace( 'Unable to rename TEMP chunk data file into proper snapshot file: ' + err );
+							resolve();
+							return;
+						}
 
 						this._file_exists = true;
 
