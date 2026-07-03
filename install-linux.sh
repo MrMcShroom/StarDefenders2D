@@ -369,6 +369,13 @@ ensure_base_packages() {
   if ! command_exists curl && ! command_exists wget; then
     append_package_if_missing "${manager}" packages "curl"
   fi
+  # setfacl lets us grant the service user read access to a shared Let's Encrypt
+  # key additively (u:USER:r) instead of via single-owner chgrp. Without it the
+  # SSL grant falls back to group ownership, which a second slot's install on the
+  # same box silently steals -> EACCES on privkey.pem for the first slot.
+  if ! command_exists setfacl; then
+    append_package_if_missing "${manager}" packages "acl"
+  fi
 
   case "${manager}" in
     apt)
@@ -1560,6 +1567,49 @@ for d in "${APP_DIR}/chunks${suffix}" "${APP_DIR}/crash_reports"; do
     chown -R "${APP_USER}:${APP_GROUP}" "${d}" || echo "${SERVICE_NAME}-fixperms: WARNING chown failed for ${d}" >&2
   fi
 done
+
+# 5) SSL cert/key read access -- self-heal on every boot. index.js reads the key
+#    directly at startup, and the install-time grant does NOT survive:
+#      * certbot renewal writes a fresh root-owned archive/privkeyN.pem and
+#        repoints the live/ symlink, dropping the grant on the old file; the
+#        deploy hook only restarts the service.
+#      * installing another slot on the same box re-runs the group-ownership
+#        fallback (chgrp; chmod o-rwx) on the shared key, stealing this user's
+#        access.
+#    Either way the User= service then hits EACCES on privkey.pem and crash-loops
+#    until someone re-grants by hand. Re-assert an additive read ACL here so a
+#    plain restart (which the renewal hook already triggers) fixes it.
+regrant_ssl_read() {
+  command -v setfacl >/dev/null 2>&1 || return 0
+
+  local sslconfig="${APP_DIR}/sslconfig.json"
+  local cert="${SSL_CERT_PATH:-}"
+  local key="${SSL_KEY_PATH:-}"
+
+  # Fall back to the paths recorded in sslconfig.json (skip/copy modes, or a
+  # hand-edited config) when the env file did not capture them.
+  if [[ ( -z "${cert}" || -z "${key}" ) && -f "${sslconfig}" ]]; then
+    [[ -n "${cert}" ]] || cert="$(sed -n 's/.*"certpath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${sslconfig}" | head -n1)"
+    [[ -n "${key}" ]]  || key="$(sed -n 's/.*"keypath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${sslconfig}" | head -n1)"
+  fi
+
+  local p resolved dir start
+  for p in "${cert}" "${key}"; do
+    [[ -n "${p}" && -e "${p}" ]] || continue
+    resolved="$(readlink -f "${p}")"
+    [[ -f "${resolved}" ]] || continue
+    setfacl -m "u:${APP_USER}:r" "${resolved}" 2>/dev/null || true
+    # Traverse (x) on every parent dir of both the real file and the symlink.
+    for start in "$(dirname "${resolved}")" "$(dirname "${p}")"; do
+      dir="${start}"
+      while [[ -n "${dir}" && "${dir}" != "/" ]]; do
+        setfacl -m "u:${APP_USER}:x" "${dir}" 2>/dev/null || true
+        dir="$(dirname "${dir}")"
+      done
+    done
+  done
+}
+regrant_ssl_read
 
 exit 0
 EOF
