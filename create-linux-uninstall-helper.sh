@@ -99,6 +99,14 @@ rm -f \\
   "${APP_DIR}/${SERVICE_NAME}-admin-commands.txt" \\
   "${APP_DIR}/${SERVICE_NAME}-uninstall.sh"
 rm -f "/etc/letsencrypt/renewal-hooks/deploy/${SERVICE_NAME}-restart.sh" 2>/dev/null || true
+# Remove the SSL re-grant hotfix drop-in for this service (added by
+# sd2d-ssl-hotfix.sh on boxes patched before a full reinstall). Drop the shared
+# helper only when no other service still references it.
+rm -f "/etc/systemd/system/${SERVICE_NAME}.service.d/10-ssl-regrant.conf" 2>/dev/null || true
+rmdir "/etc/systemd/system/${SERVICE_NAME}.service.d" 2>/dev/null || true
+if ! grep -rqsl "/usr/local/bin/sd2d-ssl-regrant.sh" /etc/systemd/system/*.service.d/ 2>/dev/null; then
+  rm -f /usr/local/bin/sd2d-ssl-regrant.sh 2>/dev/null || true
+fi
 if [[ -d "${APP_DIR}/installerbackup" ]]; then
   read -r -p "Delete installer backup folder ${APP_DIR}/installerbackup? [y/N]: " delete_backup
   case "\${delete_backup}" in
