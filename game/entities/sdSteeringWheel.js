@@ -53,6 +53,12 @@ class sdSteeringWheel extends sdEntity
 		sdSteeringWheel.TYPE_ELEVATOR_MOTOR = 1;
 		
 		sdSteeringWheel.button_filter = [ 'sdButton' ];
+		// phase-13-rigid-01: trace-only census bucket for the (not-yet-built) rigid-group move fast path.
+		// Populated only when globalThis.DEBUG_RIGID_MOVE_ELIGIBILITY is on; production pays nothing.
+		sdSteeringWheel.rigid_eligibility_profile = sdSteeringWheel.CreateRigidEligibilityProfile();
+
+		// phase-13-rigid-04: dry-run win-estimate bucket for RIGID_MOVE_MODE==='verify'. Read-only; legacy stays authoritative.
+		sdSteeringWheel.rigid_verify_profile = sdSteeringWheel.CreateRigidVerifyProfile();
 		
 		/*
 		const drop_rate = 100; // 30000
@@ -1113,6 +1119,308 @@ class sdSteeringWheel extends sdEntity
 		}
 	}
 	
+	static CreateRigidEligibilityProfile() // phase-13-rigid-01: fresh counter bucket for the rigid-fast-path eligibility census
+	{
+		return {
+			start_time: sdWorld.time,
+			moves_total: 0,
+			moves_fully_rigid: 0,   // moves with zero legacy members (dependents allowed) -> the whole move could take the fast path
+			members_total: 0,
+			rigid_total: 0,
+			dependent_total: 0,
+			legacy_total: 0,
+			rigid_class: Object.create( null ),     // GetClass() => count, rigid bucket
+			dependent_class: Object.create( null ), // GetClass() => count, dependent bucket
+			legacy_class: Object.create( null ),    // GetClass() => count, legacy bucket
+			legacy_reason: Object.create( null )    // reason string => count
+		};
+	}
+	// phase-13-rigid-01: PURE + READ-ONLY eligibility classifier for the (not-yet-built) rigid-group move fast path.
+	// Returns which lane a steering-wheel move member WOULD take, never mutates anything. Only ever called when
+	// globalThis.DEBUG_RIGID_MOVE_ELIGIBILITY is on (Phase 2 census). Verdicts mirror the tasks.md "Phase 2a — Rigid
+	// Fast-Path Eligibility" audit. Deliberately conservative: anything not explicitly audited returns 'legacy'.
+	// Keyed on GetClass() strings + plain property reads only (no class-system / import dependency) so the
+	// _audit_rigid_eligibility_test.cjs harness can drive it with mock entities. move_set = Set of all scan+push
+	// members (for cable endpoint co-move check); partial_set = the partial_push_movement Map (one-axis movers).
+	// Returns { bucket:'rigid'|'dependent'|'legacy', reason:string }.
+	static ClassifyRigidMember( entity, move_set, partial_set )
+	{
+		if ( entity._is_being_removed )
+		return { bucket:'legacy', reason:'removed' };
+
+		// client-side / virtual / global entities never enter the rigid batch
+		if ( entity._net_id === undefined )
+		return { bucket:'legacy', reason:'no-net-id' };
+
+		// partial movers (one-axis push) must stay on the legacy lane
+		if ( partial_set && partial_set.has( entity ) )
+		return { bucket:'legacy', reason:'partial-push' };
+
+		// held / carried / contained: a parent/holder owns the relative position or snapshot dependency
+		if ( entity.held_by || entity._held_by || entity.driver_of || entity.hook_relative_to )
+		return { bucket:'legacy', reason:'held-or-contained' };
+
+		const cls = entity.GetClass();
+
+		switch ( cls )
+		{
+			case 'sdBlock': // simple player-made hull block (the bulk of a base)
+			return { bucket:'rigid', reason:'block' };
+
+			case 'sdBG': // player-made background wall
+			return { bucket:'rigid', reason:'bg' };
+
+			case 'sdNode': // phase-13-rigid-02 audit (2026-06-20): cable/signal node. SOLID static fixture, fixed hitbox (-3..3),
+			// no _sensor_area / owned children / x0-y0, default (no-op) onMovementInRange, onThink never mutates x/y, and all
+			// cable/matter/signal logic is topology-based (not absolute-position) -> safe rigid member. Simpler than sdBlock.
+			// Phase 3 must treat it as a SOLID member (hard_collision true, can block leading-edge) and Phase 4 must keep the
+			// SetHiberState(ACTIVE) wake on move (a node self-hibernates when idle), same as the legacy path already does.
+			return { bucket:'rigid', reason:'node' };
+
+
+			case 'sdTurret':
+			{
+				// KIND_LASER_PORTABLE=6 / KIND_SENTRY=9 are non-static physics turrets -> excluded (mirrors sdTurret.KIND_*)
+				if ( entity.kind === 6 || entity.kind === 9 )
+				return { bucket:'legacy', reason:'turret-portable-or-sentry' };
+				if ( !entity.is_static )
+				return { bucket:'legacy', reason:'turret-nonstatic' };
+				return { bucket:'rigid', reason:'turret-static' }; // dependent _sensor_area handled by the batch hook in Phase 4
+			}
+
+			case 'sdAntigravity': // static body; dependent _sensor_area + exterior-field callbacks handled in Phase 3/4
+			return { bucket:'rigid', reason:'antigravity' };
+
+			case 'sdCable':
+			{
+				// endpoint-locked dependent geometry: co-moves cleanly only when BOTH endpoints are in the same rigid move
+				if ( entity.p && entity.c && move_set.has( entity.p ) && move_set.has( entity.c ) )
+				return { bucket:'dependent', reason:'cable-endpoints-comoving' };
+				return { bucket:'legacy', reason:'cable-endpoint-outside' };
+			}
+
+			case 'sdSensorArea': // invisible dependent trigger volume owned by a door/turret/antigravity field
+			return { bucket:'dependent', reason:'sensor-area' };
+
+			case 'sdDoor': // x/y vs x0/y0 + openness/opening_tim/malfunction -> legacy until a dedicated hook exists
+			return { bucket:'legacy', reason:'door-openness' };
+
+			case 'sdBaseShieldingUnit': // per-protected-entity ProtectedEntityMoved bookkeeping must not be batched away
+			return { bucket:'legacy', reason:'bsu-shield-bookkeeping' };
+
+			default: // crystals/amplifiers/water/storage/mobs/items and everything not yet audited -> conservative legacy
+			return { bucket:'legacy', reason:'not-audited:' + cls };
+		}
+	}
+	static DumpRigidEligibilityProfile( reset = true ) // phase-13-rigid-01: print the census, % of members + % of fully-rigid moves
+	{
+		let p = sdSteeringWheel.rigid_eligibility_profile;
+		let dt = Math.max( 0.001, ( sdWorld.time - p.start_time ) / 1000 );
+		function pct( n, d ){ return d > 0 ? ( 100 * n / d ).toFixed( 1 ) : '0.0'; }
+		function Top( obj, limit )
+		{
+			let e = [];
+			for ( let k in obj )
+			e.push( [ k, obj[ k ] ] );
+			e.sort( ( a, b )=>b[ 1 ] - a[ 1 ] );
+			return e.slice( 0, limit ).map( x=>x[ 0 ] + '=' + x[ 1 ] ).join( ', ' );
+		}
+
+		console.warn( '[RIGID_ELIG] ' + dt.toFixed( 1 ) + 's moves=' + p.moves_total +
+			' fully_rigid_moves=' + p.moves_fully_rigid + ' (' + pct( p.moves_fully_rigid, p.moves_total ) + '%)' +
+			' | members=' + p.members_total +
+			' rigid=' + p.rigid_total + ' (' + pct( p.rigid_total, p.members_total ) + '%)' +
+			' dependent=' + p.dependent_total + ' (' + pct( p.dependent_total, p.members_total ) + '%)' +
+			' legacy=' + p.legacy_total + ' (' + pct( p.legacy_total, p.members_total ) + '%)' );
+		if ( p.rigid_total > 0 )
+		console.warn( '[RIGID_ELIG] rigid classes: ' + Top( p.rigid_class, 10 ) );
+		if ( p.dependent_total > 0 )
+		console.warn( '[RIGID_ELIG] dependent classes: ' + Top( p.dependent_class, 10 ) );
+		if ( p.legacy_total > 0 )
+		{
+			console.warn( '[RIGID_ELIG] legacy classes: ' + Top( p.legacy_class, 10 ) );
+			console.warn( '[RIGID_ELIG] legacy reasons: ' + Top( p.legacy_reason, 12 ) );
+		}
+
+		if ( reset )
+		sdSteeringWheel.rigid_eligibility_profile = sdSteeringWheel.CreateRigidEligibilityProfile();
+	}
+	static CreateRigidVerifyProfile() // phase-13-rigid-04: dry-run win-estimate bucket (RIGID_MOVE_MODE==='verify')
+	{
+		return {
+			start_time: sdWorld.time,
+			moves: 0,                 // committed moves seen
+			eligible: 0,              // moves the fast path would attempt (gate pass)
+			members: 0, rigid: 0, dependent: 0, legacy: 0,
+			fallback_reason: Object.create( null ), // why a move is gate-ineligible
+			// cell-scan reduction (Phase 4 proxy), every move:
+			per_member_cells: 0,      // sum of each rigid/dependent member's hash-cell count
+			union_cells: 0,           // distinct hash cells across the group (scan-once target)
+			// leading-edge split (Phase 3 proxy), SAMPLED moves only (geometry is O(area)):
+			sampled_moves: 0, solid_rigid: 0, interior: 0, leading: 0
+		};
+	}
+	static _MemberCellKeys( m ) // phase-13-rigid-04: hash cells m's hitbox currently overlaps (mirrors UpdateHashPosition cell math; pure, no RequireHashPosition/mutation)
+	{
+		if ( m._net_id === undefined || m._is_being_removed )
+		return null;
+		const CS = sdWorld.CHUNK_SIZE;
+		let from_x = sdWorld.FastFloor( ( m.x + m._hitbox_x1 ) / CS );
+		let from_y = sdWorld.FastFloor( ( m.y + m._hitbox_y1 ) / CS );
+		let to_x = sdWorld.FastCeil( ( m.x + m._hitbox_x2 ) / CS );
+		let to_y = sdWorld.FastCeil( ( m.y + m._hitbox_y2 ) / CS );
+		if ( to_x === from_x ) to_x++;
+		if ( to_y === from_y ) to_y++;
+		let keys = [];
+		for ( let cx = from_x; cx < to_x; cx++ )
+		for ( let cy = from_y; cy < to_y; cy++ )
+		keys.push( cx + ',' + cy );
+		return keys;
+	}
+	// phase-13-rigid-04: READ-ONLY dry run for RIGID_MOVE_MODE==='verify'. Called AFTER the legacy commit (members already at
+	// final positions). Measures, on the LIVE base, the fast path's expected win WITHOUT mutating anything: partition mix,
+	// gate-eligibility, the Phase-4 cell-scan reduction (per-member vs union cells), and (sampled) the Phase-3 skippable-probe
+	// share via the offline-proven ComputeLeadingEdgeMembers. Leading-edge split is translation-invariant under a rigid move,
+	// so measuring on post-move positions with (xx,yy) gives the same interior/leading classification as pre-move.
+	static RigidMoveDryRun( scan, stuff_to_push, partial_push_movement, xx, yy, forceful )
+	{
+		let p = sdSteeringWheel.rigid_verify_profile;
+		if ( sdWorld.time - p.start_time >= 5000 ) // auto-print + reset at most every 5s
+		{
+			sdSteeringWheel.DumpRigidVerifyProfile( true );
+			p = sdSteeringWheel.rigid_verify_profile;
+		}
+
+		let move_set = new Set( scan );
+		for ( let i = 0; i < stuff_to_push.length; i++ )
+		move_set.add( stuff_to_push[ i ] );
+
+		let rigid = [], dependent = [];
+		let rigid_n = 0, dependent_n = 0, legacy_n = 0;
+		const Tally = ( e )=>
+		{
+			let v = sdSteeringWheel.ClassifyRigidMember( e, move_set, partial_push_movement );
+			if ( v.bucket === 'rigid' ) { rigid_n++; rigid.push( e ); }
+			else if ( v.bucket === 'dependent' ) { dependent_n++; dependent.push( e ); }
+			else legacy_n++;
+		};
+		for ( let i = 0; i < scan.length; i++ ) Tally( scan[ i ] );
+		for ( let i = 0; i < stuff_to_push.length; i++ ) Tally( stuff_to_push[ i ] );
+
+		p.moves++;
+		p.members += rigid_n + dependent_n + legacy_n;
+		p.rigid += rigid_n; p.dependent += dependent_n; p.legacy += legacy_n;
+
+		// gate (design section 4, simplified for measurement): forceful moves keep legacy; otherwise eligible.
+		if ( forceful )
+		p.fallback_reason[ 'forceful' ] = ( p.fallback_reason[ 'forceful' ] || 0 ) + 1;
+		else
+		p.eligible++;
+
+		// Phase-4 proxy: cell-scan reduction over rigid+dependent (cheap; every move).
+		let union = new Set();
+		for ( let i = 0; i < rigid.length; i++ )
+		{
+			let k = sdSteeringWheel._MemberCellKeys( rigid[ i ] );
+			if ( k ) { p.per_member_cells += k.length; for ( let j = 0; j < k.length; j++ ) union.add( k[ j ] ); }
+		}
+		for ( let i = 0; i < dependent.length; i++ )
+		{
+			let k = sdSteeringWheel._MemberCellKeys( dependent[ i ] );
+			if ( k ) { p.per_member_cells += k.length; for ( let j = 0; j < k.length; j++ ) union.add( k[ j ] ); }
+		}
+		p.union_cells += union.size;
+
+		// Phase-3 proxy: leading/interior split of SOLID rigid members (sampled every 8th move; geometry is O(footprint area)).
+		if ( ( p.moves & 7 ) === 0 && ( xx !== 0 || yy !== 0 ) )
+		{
+			let solid = [];
+			for ( let i = 0; i < rigid.length; i++ )
+			if ( rigid[ i ]._hard_collision )
+			solid.push( rigid[ i ] );
+			let split = sdSteeringWheel.ComputeLeadingEdgeMembers( solid, xx, yy );
+			p.sampled_moves++;
+			p.solid_rigid += solid.length;
+			p.interior += split.interior.size;
+			p.leading += split.leading.size;
+		}
+	}
+	static DumpRigidVerifyProfile( reset = true ) // phase-13-rigid-04
+	{
+		let p = sdSteeringWheel.rigid_verify_profile;
+		let dt = Math.max( 0.001, ( sdWorld.time - p.start_time ) / 1000 );
+		function pct( n, d ){ return d > 0 ? ( 100 * n / d ).toFixed( 1 ) : '0.0'; }
+		function Top( obj ){ let e=[]; for ( let k in obj ) e.push( k+'='+obj[k] ); return e.join( ', ' ); }
+
+		console.warn( '[RIGID_VERIFY] ' + dt.toFixed( 1 ) + 's moves=' + p.moves + ' eligible=' + p.eligible + ' (' + pct( p.eligible, p.moves ) + '%)' +
+			' | members=' + p.members + ' rigid=' + pct( p.rigid, p.members ) + '% dep=' + pct( p.dependent, p.members ) + '% legacy=' + pct( p.legacy, p.members ) + '%' );
+		console.warn( '[RIGID_VERIFY] Phase4 cell-scan: per_member=' + p.per_member_cells + ' union=' + p.union_cells +
+			' -> ' + pct( p.per_member_cells - p.union_cells, p.per_member_cells ) + '% fewer cell-scans' );
+		console.warn( '[RIGID_VERIFY] Phase3 (sampled ' + p.sampled_moves + ' moves): solid_rigid=' + p.solid_rigid +
+			' interior=' + p.interior + ' (' + pct( p.interior, p.solid_rigid ) + '% probes skippable) leading=' + p.leading );
+		if ( p.moves - p.eligible > 0 )
+		console.warn( '[RIGID_VERIFY] fallback: ' + Top( p.fallback_reason ) );
+
+		if ( reset )
+		sdSteeringWheel.rigid_verify_profile = sdSteeringWheel.CreateRigidVerifyProfile();
+	}
+	// phase-13-rigid-03 (2026-06-20): PURE leading-edge geometry for the Phase 3 v2 edge-only collision probe. NOT YET WIRED
+	// into the move path (zero behavior impact until adopted; see rigid-move-design.md §5). Given rigid members translating
+	// by (dx,dy), returns which members can NEWLY overlap something OUTSIDE the group (must be collision-probed = 'leading')
+	// vs members that provably move into space simultaneously vacated by a co-moving member ('interior' = skippable).
+	// CONSERVATIVE BY CONSTRUCTION (the safety property): occupancy uses only FULLY-covered cells (under-approx of where the
+	// group is) and the swept region uses INTERSECTING cells (over-approx of where a member goes) — both bias toward marking
+	// a member 'leading', so the function can over-probe but can NEVER wrongly skip a member. Pure + offline-unit-tested
+	// (_audit_rigid_leadingedge_test.cjs). members: array of objects exposing x,y,_hitbox_x1.._hitbox_y2 (abs bounds = x+hx).
+	// G = raster cell size in px (default 1 = exact for integer bounds; coarser G is cheaper but must be <= smallest member
+	// dimension or occupancy under-counts and everything becomes 'leading' — still safe, just no win). Returns {leading,interior}.
+	static ComputeLeadingEdgeMembers( members, dx, dy, G = 1 )
+	{
+		const leading = new Set(), interior = new Set();
+
+		if ( dx === 0 && dy === 0 ) // no translation -> nothing can newly overlap; all interior
+		{
+			for ( let i = 0; i < members.length; i++ )
+			interior.add( members[ i ] );
+			return { leading, interior };
+		}
+
+		// Pass 1: occupancy = cells FULLY inside some member's current footprint (under-approx => safe).
+		const occupied = new Set();
+		for ( let i = 0; i < members.length; i++ )
+		{
+			const m = members[ i ];
+			const cxa = Math.ceil( ( m.x + m._hitbox_x1 ) / G ), cxb = Math.floor( ( m.x + m._hitbox_x2 ) / G ) - 1;
+			const cya = Math.ceil( ( m.y + m._hitbox_y1 ) / G ), cyb = Math.floor( ( m.y + m._hitbox_y2 ) / G ) - 1;
+			for ( let cx = cxa; cx <= cxb; cx++ )
+			for ( let cy = cya; cy <= cyb; cy++ )
+			occupied.add( cx + ',' + cy );
+		}
+
+		// Pass 2: a member is 'leading' if ANY cell its swept rect intersects (over-approx => safe) is not occupied.
+		for ( let i = 0; i < members.length; i++ )
+		{
+			const m = members[ i ];
+			const sL = m.x + m._hitbox_x1 + Math.min( 0, dx ), sR = m.x + m._hitbox_x2 + Math.max( 0, dx );
+			const sT = m.y + m._hitbox_y1 + Math.min( 0, dy ), sB = m.y + m._hitbox_y2 + Math.max( 0, dy );
+			const cxa = Math.floor( sL / G ), cxb = Math.ceil( sR / G ) - 1;
+			const cya = Math.floor( sT / G ), cyb = Math.ceil( sB / G ) - 1;
+			let is_leading = false;
+			for ( let cx = cxa; cx <= cxb && !is_leading; cx++ )
+			for ( let cy = cya; cy <= cyb; cy++ )
+			if ( !occupied.has( cx + ',' + cy ) )
+			{
+				is_leading = true;
+				break;
+			}
+			if ( is_leading )
+			leading.add( m );
+			else
+			interior.add( m );
+		}
+
+		return { leading, interior };
+	}
 	static ComplexElevatorLikeMove( scan, _scan_net_ids, xx, yy, forceful, GSPEED, force_push_bsus=false, initiator=null ) // GSPEED only used for damage scaling
 	{
 		let stuff_to_push = [];
@@ -1440,12 +1748,20 @@ class sdSteeringWheel extends sdEntity
 
 		if ( will_move || forceful )
 		{
+			// phase-13-rigid-05: when RIGID_MOVE_MODE==='on', defer hash-membership updates for ALL moved members to one
+			// batched two-stage rehash after both commit loops, and replace the per-member callback fan-out with a
+			// scan-each-cell-once cached pass. Byte-identical to the legacy per-member path (rigid-move-design.md §6); the
+			// collision decision above is untouched so will_move / stuff_to_push / stopping are unchanged. 'off' (default)
+			// and 'verify' keep the legacy path exactly.
+			let rigid_on = ( globalThis.RIGID_MOVE_MODE === 'on' );
+
 			for ( let i = 0; i < scan.length; i++ )
 			{
 				let current = scan[ i ];
 
 				current.x += xx;
 				current.y += yy;
+				if ( !rigid_on )
 				sdWorld.UpdateHashPosition( current, false, false );
 				current._last_x = current.x; // Hacky, prevents calling ManageTrackedPhysWakeup in sdWorld entity loop
 				current._last_y = current.y; // Hacky, prevents calling ManageTrackedPhysWakeup in sdWorld entity loop
@@ -1472,7 +1788,19 @@ class sdSteeringWheel extends sdEntity
 				}
 				
 				current.SetHiberState( sdEntity.HIBERSTATE_ACTIVE );
-				
+
+			}
+			// phase-13-snapshot-02: record this rigid hull translation so the per-client snapshot can send ONE group
+			// delta ( [ -3, dx, dy, [net_ids] ] ) instead of a per-part x/y diff for every moved part. Only the `scan`
+			// members (full xx,yy movers) are recorded; stuff_to_push (possible partial movers) stay on per-part sync.
+			// Self-clearing per server frame; consumed by sdByteShifter.SendSnapshot. Gated, flag off by default.
+			if ( globalThis.RIGID_SNAPSHOT_DELTA && ( xx !== 0 || yy !== 0 ) && scan.length > 0 )
+			{
+				let _F = globalThis.GetFrame ? globalThis.GetFrame() : sdWorld.time;
+				let _frg = sdWorld.frame_rigid_groups;
+				if ( !_frg ) _frg = sdWorld.frame_rigid_groups = { frame: -1, groups: [] };
+				if ( _frg.frame !== _F ) { _frg.frame = _F; _frg.groups.length = 0; }
+				_frg.groups.push({ members: Array.from( scan ), dx: xx, dy: yy });
 			}
 			for ( let i = 0; i < stuff_to_push.length; i++ )
 			{
@@ -1499,12 +1827,13 @@ class sdSteeringWheel extends sdEntity
 				{
 					throw new Error();
 				}
+				if ( !rigid_on )
 				sdWorld.UpdateHashPosition( item, false, false );
 				item._last_x = item.x; // Hacky, prevents calling ManageTrackedPhysWakeup in sdWorld entity loop
 				item._last_y = item.y; // Hacky, prevents calling ManageTrackedPhysWakeup in sdWorld entity loop
-				
+
 				item.SetHiberState( sdEntity.HIBERSTATE_ACTIVE );
-				
+
 				item.PhysWakeUp();
 				
 				//item.ManageTrackedPhysWakeup();
@@ -1516,17 +1845,127 @@ class sdSteeringWheel extends sdEntity
 				else
 				item.ApplyStatusEffect({ type: sdStatusEffect.TYPE_STEERING_WHEEL_MOVEMENT_SMOOTH, tx:item.x, ty:item.y });
 			}
-			
-			// Call movement in range for everything together, or else motors won't trigger any switches
-			for ( let i = 0; i < scan.length; i++ )
+
+			// phase-13-rigid-05: fast-path membership rehash (§6a). All members are now at final x/y; batch their
+			// hash-cell membership in one two-stage pass (no per-member churn). Only when RIGID_MOVE_MODE==='on'.
+			let rigid_all_moved = null;
+			if ( rigid_on )
 			{
-				let current = scan[ i ];
-				sdWorld.UpdateHashPosition( current, false, true );
+				rigid_all_moved = [];
+				for ( let i = 0; i < scan.length; i++ )
+				rigid_all_moved.push( scan[ i ] );
+				for ( let i = 0; i < stuff_to_push.length; i++ )
+				rigid_all_moved.push( stuff_to_push[ i ] );
+				sdWorld.UpdateHashPositionBatchRigid( rigid_all_moved );
 			}
-			for ( let i = 0; i < stuff_to_push.length; i++ )
+
+			// phase-13-rigid-01: trace-only rigid-fast-path eligibility census (gated; counting only, no behavior change).
+			// Runs once per COMMITTED move and answers tasks.md Phase 2: does the live moving base have enough rigid/
+			// dependent members (vs legacy hold-outs) to justify the structural rewrite? Reads the already-final scan +
+			// stuff_to_push + partial_push_movement that were just moved above.
+			if ( globalThis.DEBUG_RIGID_MOVE_ELIGIBILITY )
 			{
-				let current = stuff_to_push[ i ];
-				sdWorld.UpdateHashPosition( current, false, true );
+				if ( sdWorld.time - sdSteeringWheel.rigid_eligibility_profile.start_time >= 5000 ) // auto-print + reset at most every 5s
+				sdSteeringWheel.DumpRigidEligibilityProfile( true );
+
+				let prof = sdSteeringWheel.rigid_eligibility_profile;
+
+				let move_set = new Set( scan );
+				for ( let i = 0; i < stuff_to_push.length; i++ )
+				move_set.add( stuff_to_push[ i ] );
+
+				let rigid_n = 0, dependent_n = 0, legacy_n = 0;
+				const Tally = ( entity )=>
+				{
+					let v = sdSteeringWheel.ClassifyRigidMember( entity, move_set, partial_push_movement );
+					let cls = entity.GetClass();
+					if ( v.bucket === 'rigid' )
+					{
+						rigid_n++;
+						prof.rigid_class[ cls ] = ( prof.rigid_class[ cls ] || 0 ) + 1;
+					}
+					else if ( v.bucket === 'dependent' )
+					{
+						dependent_n++;
+						prof.dependent_class[ cls ] = ( prof.dependent_class[ cls ] || 0 ) + 1;
+					}
+					else
+					{
+						legacy_n++;
+						prof.legacy_class[ cls ] = ( prof.legacy_class[ cls ] || 0 ) + 1;
+						prof.legacy_reason[ v.reason ] = ( prof.legacy_reason[ v.reason ] || 0 ) + 1;
+					}
+				};
+				for ( let i = 0; i < scan.length; i++ )
+				Tally( scan[ i ] );
+				for ( let i = 0; i < stuff_to_push.length; i++ )
+				Tally( stuff_to_push[ i ] );
+
+				prof.moves_total++;
+				prof.members_total += rigid_n + dependent_n + legacy_n;
+				prof.rigid_total += rigid_n;
+				prof.dependent_total += dependent_n;
+				prof.legacy_total += legacy_n;
+				if ( legacy_n === 0 )
+				prof.moves_fully_rigid++;
+			}
+
+
+			// phase-13-rigid-04: verify/dry-run mode — read-only fast-path win estimate on the live base (legacy stays authoritative).
+			// Wrapped so a diagnostic bug can NEVER affect the real move — verify mode is strictly zero-risk.
+			if ( globalThis.RIGID_MOVE_MODE === 'verify' )
+			{
+				try { sdSteeringWheel.RigidMoveDryRun( scan, stuff_to_push, partial_push_movement, xx, yy, forceful ); }
+				catch ( e ) { if ( !sdSteeringWheel._rigid_verify_warned ) { sdSteeringWheel._rigid_verify_warned = true; console.warn( '[RIGID_VERIFY] dry-run error (suppressed, legacy unaffected): ' + e ); } }
+			}
+
+			if ( rigid_on )
+			{
+				// phase-13-rigid-05: fast-path callback fan-out (§6b). Membership is already final (batch above), so scan the
+				// union of the group's cells ONCE to find reactive occupants, then dispatch per member in the SAME
+				// scan-then-push order as legacy. Byte-identical onMovementInRange multiset+order; the cache is pinned to the
+				// membership seq so any callback that mutates the hash mid-pass safely drops the rest to the full scan.
+				let cache = sdWorld.BuildRigidReactiveCache( rigid_all_moved );
+				let cache_seq = sdWorld._rigid_membership_seq;
+				for ( let i = 0; i < scan.length; i++ )
+				sdWorld.RigidMemberCallbacks( scan[ i ], cache, cache_seq );
+				for ( let i = 0; i < stuff_to_push.length; i++ )
+				sdWorld.RigidMemberCallbacks( stuff_to_push[ i ], cache, cache_seq );
+			}
+			else
+			{
+				// phase-13-lagmachine-03: expose the rigid co-moving set ONLY around the post-move callback pass
+				// (allow_calling_movement_in_range=true) so the gated profiler in sdWorld.UpdateHashPosition can count
+				// fan-out pairs where both entities moved by the same delta this tick (candidates for redundant callbacks).
+				// Built only when the debug flag is on, so production pays nothing; cleared in finally so it never leaks.
+				// NOT set during the collision-probe / hash-membership-only passes above (allow_calling_movement_in_range=false).
+				let rigid_ctx_set = null;
+				if ( globalThis.DEBUG_MOVEMENT_CALLBACK_PROFILE )
+				{
+					rigid_ctx_set = new Set( scan );
+					for ( let i = 0; i < stuff_to_push.length; i++ )
+					rigid_ctx_set.add( stuff_to_push[ i ] );
+					sdWorld.current_rigid_move_context = { set: rigid_ctx_set, dx: xx, dy: yy, initiator: initiator };
+				}
+				try
+				{
+					// Call movement in range for everything together, or else motors won't trigger any switches
+					for ( let i = 0; i < scan.length; i++ )
+					{
+						let current = scan[ i ];
+						sdWorld.UpdateHashPosition( current, false, true );
+					}
+					for ( let i = 0; i < stuff_to_push.length; i++ )
+					{
+						let current = stuff_to_push[ i ];
+						sdWorld.UpdateHashPosition( current, false, true );
+					}
+				}
+				finally
+				{
+					if ( rigid_ctx_set !== null )
+					sdWorld.current_rigid_move_context = null;
+				}
 			}
 		}
 		else

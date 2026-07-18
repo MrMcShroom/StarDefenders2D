@@ -136,8 +136,38 @@ class sdWorld
 		sdWorld.last_frame_time = 0; // For lag reporting
 		sdWorld.last_slowest_class = 'nothing';
 
+		// phase-13-lagmachine-03 instrumentation (read-only, gated by globalThis.DEBUG_MOVEMENT_CALLBACK_PROFILE).
+		// current_rigid_move_context is set by sdSteeringWheel ONLY around its post-move callback pass so the
+		// profiler can tell rigid-co-moving pairs (candidates for redundant fan-out) from genuine ones.
+		// The always-present null check is cheap and keeps the hot UpdateHashPosition path branch-light when the flag is off.
+		sdWorld.current_rigid_move_context = null; // { set:Set<entity>, dx, dy, initiator } or null
+		// phase-13-rigid-05: monotonic counter bumped ONLY when UpdateHashPosition / the rigid batch actually change a
+		// hash-cell membership. The rigid fast-path callback fan-out builds a per-cell reactive-occupant cache once and
+		// trusts it only while this counter is unchanged; if a movement callback moves/removes an entity mid-pass (real
+		// membership change) the counter advances and the remaining members fall back to the full per-cell scan, keeping
+		// the fast path byte-identical to legacy regardless of what callbacks do. Distinct from _los_cache_epoch, which
+		// over-bumps (every call) and would spuriously invalidate the cache.
+		sdWorld._rigid_membership_seq = 0;
+		sdWorld.movement_callback_profile = sdWorld.CreateMovementCallbackProfile();
+		// phase-13-updatehash-08: separate self-time split profiler for UpdateHashPosition, gated by globalThis.DEBUG_UPDATEHASH_SELFTIME
+		// (independent of the callback-pair profiler above). Splits self-cost into hitbox / cell-list build / equality / old-cell remove /
+		// new-cell push / callback scan / callback invoke so the next optimization target inside UpdateHashPosition is data-driven, not guessed.
+		sdWorld.updatehash_selftime_profile = sdWorld.CreateUpdateHashSelfTimeProfile();
+		// phase-13-fanout-01: read-only measurement for general-fanout-design.md's gate — per mover CLASS, the candidate-scan
+		// iteration cost (entries walked) split by whether the MOVER has a handler (m1), plus how many of the walked neighbours
+		// are reactive (would survive a Cell.reactive_arr index). Gated by globalThis.DEBUG_FANOUT_MOVERS (one null-check when off).
+		sdWorld.fanout_movers_profile = sdWorld.CreateFanoutMoversProfile();
+		// phase-13-fanout-02: dry-run for the two real levers — status-effect fan-out skip + sensor-area filter. Gated by globalThis.DEBUG_FANOUT_DRY.
+		sdWorld.fanout_dry_profile = sdWorld.CreateFanoutDryProfile();
 		// phase-13-fanout-03: live byte-identical check for the sensor-area index (SENSOR_SCAN_MODE==='verify').
 		sdWorld.sensor_verify_profile = sdWorld.CreateSensorVerifyProfile();
+		// phase-13-fanout-05: live byte-identical check for the non-handler-mover reactive index (REACTIVE_SCAN_MODE==='verify').
+		sdWorld.reactive_verify_profile = sdWorld.CreateReactiveVerifyProfile();
+		// phase-13-fanout-04: lazily-built Set of receiver-class constructors that are PROVEN no-op when reacting to an
+		// sdSensorArea mover (per-class onMovementInRange audit, lag-machine-profiling.md). Tightens both CanReactToMovement
+		// (drops dead onMovementInRange(sensorArea) calls game-wide) AND _SensorRelevant (drops them from the turret-sensor
+		// index) from the SAME set, so the index stays byte-identical to the full scan (verify mode is the live gate).
+		sdWorld._sensor_dead_receiver_set = null;
 
 		sdWorld.target_scale = 2; // Current one, this one depends on screen size
 		sdWorld.default_zoom = 2;
@@ -218,7 +248,25 @@ class sdWorld
 		sdWorld.world_hash_positions_recheck_keys = new Set(); // Set of keys to slowly check and delete if they are empty (can happen as a result of requiring cells by world logic)
 		
 		sdWorld.last_hit_entity = null;
-		
+
+		// Phase 7 (phase-7-los-02): same-tick line-of-sight result reuse.
+		// CheckLineOfSight casts ~29 CheckWallExists ray-steps per call; the profile attributed
+		// ~96% of CheckWallExists-via-LOS to sdDrone/sdCharacter/sdTurret repeatedly raycasting.
+		// _los_cache_epoch is bumped by UpdateHashPosition (the ONLY mutator of collision-hash
+		// membership/positions), so a cached ray result stays bit-identical to a recompute for as
+		// long as the epoch is unchanged (i.e. nothing entered/left/moved in any hash cell). A tiny
+		// fixed ring of slots catches identical rays issued back-to-back inside one entity tick
+		// (e.g. AI evaluates LOS to a target, then re-checks the same target before moving). Only
+		// custom_filtering_method===null calls are cached (filter calls can carry per-call state).
+		// Disable instantly with globalThis.DISABLE_LOS_CACHE; count hits/misses with globalThis.DEBUG_LOS_CACHE.
+		sdWorld._los_cache_epoch = 0;
+		sdWorld._los_cache_write = 0;
+		sdWorld._los_cache_hits = 0;
+		sdWorld._los_cache_misses = 0;
+		sdWorld._los_cache_slots = [];
+		for ( let _los_i = 0; _los_i < 8; _los_i++ )
+		sdWorld._los_cache_slots.push( { epoch: -1, x1: 0, y1: 0, x2: 0, y2: 0, ignore: null, inc: null, ign: null, result: false, hit_entity: null } );
+
 		sdWorld.hovered_entity = null; // With cursor
 		
 		sdWorld.crystal_shard_value = 3;
@@ -1940,13 +1988,28 @@ class sdWorld
 	static GetAnythingNearOnlyNonHibernated( _x, _y, range, append_to=null, specific_classes=null, filter_candidates_function=null ) // Kind of faster
 	{
 		let ret = append_to || [];
-		
+
 		const arr = sdEntity.active_entities;
-		
+
 		let i, e;
 		let cx,cy;
 		let x1,y1,x2,y2;
-		
+
+		// phase-8-spatial-01: O(1) visited-flag dedup instead of O(n) ret.indexOf, used ONLY when
+		// no caller filter runs in the loop. A filter_candidates_function could recursively call a
+		// spatial query and grab the shared sdEntity._flag, corrupting our marks; with no filter the
+		// loop runs no user code, so the flag is exclusively ours. active_entities has no internal
+		// duplicates, so here the dedup only protects against re-adding pre-existing append_to entries
+		// (pre-marked below) - matching the old indexOf, which scanned the whole ret.
+		const use_flag_dedup = ( filter_candidates_function === null );
+		let visited_ent_flag = 0;
+		if ( use_flag_dedup )
+		{
+			visited_ent_flag = sdEntity.GetUniqueFlagValue();
+			for ( let pi = 0; pi < ret.length; pi++ )
+			ret[ pi ]._flag = visited_ent_flag;
+		}
+
 		for ( i = 0; i < arr.length; i++ )
 		{
 			e = arr[ i ];
@@ -1965,17 +2028,36 @@ class sdWorld
 
 				//if ( sdWorld.inDist2D( _x, _y, cx, cy, range ) >= 0 )
 				if ( sdWorld.inDist2D_Boolean( _x, _y, cx, cy, range ) )
-				if ( ret.indexOf( e ) === -1 )
-				ret.push( e );
+				if ( use_flag_dedup ? e._flag !== visited_ent_flag : ret.indexOf( e ) === -1 )
+				{
+					if ( use_flag_dedup )
+					e._flag = visited_ent_flag;
+					ret.push( e );
+				}
 			}
 		}
-		
+
 		return ret;
 	}
 	static GetAnythingNear( _x, _y, range, append_to=null, specific_classes=null, filter_candidates_function=null )
 	{
 		let ret = append_to || [];
-		
+
+		// phase-8-spatial-01: O(1) visited-flag dedup instead of O(n) ret.indexOf, used ONLY when no
+		// caller filter runs in the loop (a filter could recursively call a spatial query and grab the
+		// shared sdEntity._flag, corrupting our marks; with no filter the loop runs no user code, so
+		// the flag is ours alone for this call). Here multi-cell entities legitimately appear in
+		// several scanned cells, so the dedup matters intra-call too; pre-marking the existing
+		// append_to entries reproduces the old indexOf, which scanned the whole ret.
+		const use_flag_dedup = ( filter_candidates_function === null );
+		let visited_ent_flag = 0;
+		if ( use_flag_dedup )
+		{
+			visited_ent_flag = sdEntity.GetUniqueFlagValue();
+			for ( let pi = 0; pi < ret.length; pi++ )
+			ret[ pi ]._flag = visited_ent_flag;
+		}
+
 		let min_x = sdWorld.FastFloor((_x - range)/CHUNK_SIZE);
 		let min_y = sdWorld.FastFloor((_y - range)/CHUNK_SIZE);
 		let max_x = sdWorld.FastCeil((_x + range)/CHUNK_SIZE);
@@ -2054,14 +2136,18 @@ class sdWorld
 							cy = Math.max( e.y + y1, Math.min( _y, e.y + y2 ) );
 
 							if ( sdWorld.inDist2D_Boolean( _x, _y, cx, cy, range ) )
-							if ( ret.indexOf( e ) === -1 )
-							ret.push( e );
+							if ( use_flag_dedup ? e._flag !== visited_ent_flag : ret.indexOf( e ) === -1 )
+							{
+								if ( use_flag_dedup )
+								e._flag = visited_ent_flag;
+								ret.push( e );
+							}
 						}
 					}
 				}
 			}
 		}
-		
+
 		return ret;
 	}
 	static GetAnythingNearWithLOS( _x, _y, range, append_to=null, specific_classes=null, filter_candidates_function=null )
@@ -2676,11 +2762,31 @@ class sdWorld
 		else
 		return ~~v;
 	}
-	// Behavior-preserving movement-callback reaction filter. UpdateHashPosition only queues an onMovementInRange
-	// pair when CanReactToMovement( a, b ) || CanReactToMovement( b, a ) is true; otherwise the pair is a proven
-	// no-op (per the movement-reaction semantics audit) and is skipped, removing the dominant onMovementInRange
-	// fan-out cost when many entities move together in one tick (e.g. a steering-wheel base move). Returns false
-	// ONLY for cases proven to never change state; when unsure it returns true (never skips a pair that could react).
+	static CreateMovementCallbackProfile() // phase-13-lagmachine-03: fresh counter bucket for movement-callback fan-out
+	{
+		return {
+			start_time: sdWorld.time,
+			update_hash_calls: 0,
+			candidate_pairs: 0,
+			handler_pairs: 0,
+			map_added_pairs: 0,
+			water_forced_pairs: 0,
+			callback_calls: 0,
+			same_rigid_move_candidate_pairs: 0,
+			same_rigid_move_map_added_pairs: 0,
+			added_class_pairs: Object.create( null ),
+			callback_class_pairs: Object.create( null ),
+			would_skip_pairs: 0, // phase-13-updatehash-05: map-added pairs the dry-run filter (CanReactToMovement) would drop entirely
+			would_skip_callbacks: 0, // phase-13-updatehash-05: onMovementInRange invocations those skipped pairs would have made
+			would_skip_class_pairs: Object.create( null ) // phase-13-updatehash-05: "moverClass -> otherClass" => count, would-skip pairs only
+		};
+	}
+	// phase-13-updatehash-06: LIVE reaction predicate. UpdateHashPosition keeps a movement-callback pair only when
+	// CanReactToMovement( a, b ) || CanReactToMovement( b, a ) is true; otherwise the pair is a proven no-op and is skipped.
+	// Returns true if `receiver` could plausibly react to `mover` moving into range. Returns false ONLY for the proven-safe
+	// no-op cases established by the phase-13-updatehash-04 semantics audit (lag-machine-profiling.md). Deliberately conservative:
+	// when unsure it returns true (never skips a pair that could react). Validated on the slot-1003 moving-base capture
+	// (phase-13-updatehash-05: ~80-84% of map_added pairs were proven-dead).
 	static CanReactToMovement( receiver, mover )
 	{
 		// A receiver with no override of onMovementInRange is the base no-op -> can never react.
@@ -2692,8 +2798,9 @@ class sdWorld
 
 		// sdBlock receiver (sdBlock.onMovementInRange): reacts only if material is SHARP/CORRUPTION AND same _is_bg_entity layer.
 		// Ordinary blocks (the bulk of a moving base) react to nothing; the bg-layer guard always rejects sensor/BG/statuseffect movers.
-		// Conservative: the finer held-gun/bone/effect/player-driver sub-guards are NOT modelled, so this can only under-count skips.
-		const sdBlock_class = ec.sdBlock;
+		// Conservative: the finer held-gun/bone/effect/player-driver sub-guards are NOT modelled (would only skip more), so this can
+		// only under-count skips, never project an unsafe one.
+		const sdBlock_class = ec.sdBlock; // phase-13-updatehash-08: cache the class ref (used 3x) to avoid repeated property lookups on ec
 		if ( rc === sdBlock_class )
 		{
 			if ( receiver.material !== sdBlock_class.MATERIAL_SHARP && receiver.material !== sdBlock_class.MATERIAL_CORRUPTION )
@@ -2708,14 +2815,14 @@ class sdWorld
 		{
 			const target = receiver.on_movement_target;
 			if ( !target || target._is_being_removed )
-			return true; // unknown/about-to-remove target: do not skip
+			return true; // unknown/about-to-remove target: do not project a skip
 			const tc = target.constructor;
 			if ( tc === ec.sdTurret )
-			return ec.sdTurret.targetable_classes.has( mover.constructor ); // turret only add/deletes targetable classes; delete is a no-op for never-added non-targetable classes
+			return ec.sdTurret.targetable_classes.has( mover.constructor ); // dead unless mover is an actual turret target
 			if ( tc === ec.sdDoor )
 			{
 				// AI_TEAM doors react ONLY to (non-static) sdCharacter/sdDrone of their team -> a non-char/drone mover is provably dead (class-based).
-				// COM_NODE doors match subscribers by net_id/biometry/GetClass()/'*', any of which could match a MOVING static entity -> cannot prove dead, keep.
+				// COM_NODE doors match subscribers by net_id/biometry/GetClass()/'*', any of which could match a moving static entity -> cannot prove dead, keep.
 				if ( target.open_type === ec.sdDoor.OPEN_TYPE_AI_TEAM )
 				return mover.is( ec.sdCharacter ) || mover.is( ec.sdDrone );
 				return true;
@@ -2723,15 +2830,172 @@ class sdWorld
 			return true; // sdAntigravity (reacts to ALL movers incl. blocks) or any other/subclass target: never skip
 		}
 
-		return true; // any other receiver: not proven safe -> never skip
+		// phase-13-fanout-04: receiver classes proven (per-class onMovementInRange audit, lag-machine-profiling.md) to no-op
+		// against an sdSensorArea mover. Removes those dead callback invocations game-wide AND keeps the turret-sensor index
+		// (_SensorRelevant, same set) byte-identical to the full scan. Gated on the mover being sdSensorArea -> zero effect on
+		// any other mover. Targetable receivers are NOT in the set, so turret detection (the m1/targetable direction) is intact.
+		if ( mover.constructor === ec.sdSensorArea && sdWorld._SensorDeadReceiverClasses().has( rc ) )
+		return false;
+
+		return true; // any other receiver: not proven safe -> never project a skip
+	}
+	static DumpMovementCallbackProfile( reset = true ) // phase-13-lagmachine-03: print compact summary, sorted by count
+	{
+		let p = sdWorld.movement_callback_profile;
+		let dt = Math.max( 0.001, ( sdWorld.time - p.start_time ) / 1000 );
+
+		function TopPairs( obj, limit )
+		{
+			let entries = [];
+			for ( let k in obj )
+			entries.push( [ k, obj[ k ] ] );
+			entries.sort( ( a, b )=>b[ 1 ] - a[ 1 ] );
+			return entries.slice( 0, limit );
+		}
+
+		let rigid_share = p.candidate_pairs > 0 ? ( 100 * p.same_rigid_move_candidate_pairs / p.candidate_pairs ).toFixed( 1 ) : '0.0';
+		let rigid_added_share = p.map_added_pairs > 0 ? ( 100 * p.same_rigid_move_map_added_pairs / p.map_added_pairs ).toFixed( 1 ) : '0.0';
+
+		console.warn( '[MOVE_CB] ' + dt.toFixed( 1 ) + 's | hash_calls=' + p.update_hash_calls +
+			' candidates=' + p.candidate_pairs + ' handler=' + p.handler_pairs +
+			' map_added=' + p.map_added_pairs + ' water=' + p.water_forced_pairs +
+			' callbacks=' + p.callback_calls +
+			' | same_rigid: cand=' + p.same_rigid_move_candidate_pairs + ' (' + rigid_share + '% of cand)' +
+			' added=' + p.same_rigid_move_map_added_pairs + ' (' + rigid_added_share + '% of added)' );
+
+		let added_top = TopPairs( p.added_class_pairs, 12 );
+		if ( added_top.length > 0 )
+		console.warn( '[MOVE_CB] top map.add class pairs (mover -> other): ' + added_top.map( e=>e[ 0 ] + '=' + e[ 1 ] ).join( ', ' ) );
+
+		let cb_top = TopPairs( p.callback_class_pairs, 12 );
+		if ( cb_top.length > 0 )
+		console.warn( '[MOVE_CB] top callback class pairs (callee <- from): ' + cb_top.map( e=>e[ 0 ] + '=' + e[ 1 ] ).join( ', ' ) );
+
+		// phase-13-updatehash-05: projected savings of the dry-run reaction filter (no callbacks actually skipped yet).
+		let skip_added_share = p.map_added_pairs > 0 ? ( 100 * p.would_skip_pairs / p.map_added_pairs ).toFixed( 1 ) : '0.0';
+		let skip_cb_share = p.callback_calls > 0 ? ( 100 * p.would_skip_callbacks / p.callback_calls ).toFixed( 1 ) : '0.0';
+		console.warn( '[MOVE_CB] WOULD_SKIP (dry-run): pairs=' + p.would_skip_pairs + ' (' + skip_added_share + '% of map_added)' +
+			' callbacks=' + p.would_skip_callbacks + ' (' + skip_cb_share + '% of callbacks)' +
+			'  [target >=30-50% of map_added to justify phase-13-updatehash-06]' );
+		let skip_top = TopPairs( p.would_skip_class_pairs, 12 );
+		if ( skip_top.length > 0 )
+		console.warn( '[MOVE_CB] top would-skip class pairs (mover -> other): ' + skip_top.map( e=>e[ 0 ] + '=' + e[ 1 ] ).join( ', ' ) );
+
+		if ( reset )
+		sdWorld.movement_callback_profile = sdWorld.CreateMovementCallbackProfile();
+	}
+	static CreateUpdateHashSelfTimeProfile() // phase-13-updatehash-08: self-time split buckets for UpdateHashPosition (ms accumulators)
+	{
+		return {
+			start_time: sdWorld.time,
+			calls: 0,
+			hitbox_ms: 0,          // entity.UpdateHitbox()
+			cell_list_ms: 0,       // building new_affected_hash_arrays (FastFloor/Ceil bounds + RequireHashPosition)
+			equality_ms: 0,        // ArraysEqualIgnoringOrder old-vs-new affected-cell comparison
+			old_remove_ms: 0,      // removing entity from old cells (indexOf + splice + empty-cell delete)
+			new_push_ms: 0,        // pushing entity into new cells
+			callback_scan_ms: 0,   // overlap scan + reaction filter that builds the callback Set
+			callback_invoke_ms: 0  // map.forEach onMovementInRange dispatch
+		};
+	}
+	static DumpUpdateHashSelfTimeProfile( reset = true ) // phase-13-updatehash-08: print self-time split, % of measured total
+	{
+		let p = sdWorld.updatehash_selftime_profile;
+		let dt = Math.max( 0.001, ( sdWorld.time - p.start_time ) / 1000 );
+		let total = p.hitbox_ms + p.cell_list_ms + p.equality_ms + p.old_remove_ms + p.new_push_ms + p.callback_scan_ms + p.callback_invoke_ms;
+		function pct( ms ){ return total > 0 ? ( 100 * ms / total ).toFixed( 1 ) : '0.0'; }
+
+		console.warn( '[UHASH_SELF] ' + dt.toFixed( 1 ) + 's calls=' + p.calls + ' measured_total=' + total.toFixed( 1 ) + 'ms' +
+			' | hitbox=' + p.hitbox_ms.toFixed( 1 ) + '(' + pct( p.hitbox_ms ) + '%)' +
+			' cell_list=' + p.cell_list_ms.toFixed( 1 ) + '(' + pct( p.cell_list_ms ) + '%)' +
+			' equality=' + p.equality_ms.toFixed( 1 ) + '(' + pct( p.equality_ms ) + '%)' +
+			' old_remove=' + p.old_remove_ms.toFixed( 1 ) + '(' + pct( p.old_remove_ms ) + '%)' +
+			' new_push=' + p.new_push_ms.toFixed( 1 ) + '(' + pct( p.new_push_ms ) + '%)' +
+			' cb_scan=' + p.callback_scan_ms.toFixed( 1 ) + '(' + pct( p.callback_scan_ms ) + '%)' +
+			' cb_invoke=' + p.callback_invoke_ms.toFixed( 1 ) + '(' + pct( p.callback_invoke_ms ) + '%)' );
+
+		if ( reset )
+		sdWorld.updatehash_selftime_profile = sdWorld.CreateUpdateHashSelfTimeProfile();
+	}
+	static CreateFanoutMoversProfile() // phase-13-fanout-01
+	{
+		return { start_time: sdWorld.time, by_class: Object.create( null ) };
+		// by_class[cls] = { calls_nh, calls_h, cand_nh, cand_h, react_nh, react_h }
+		//   nh = the MOVER has a default onMovementInRange (m1 false) -> a Cell.reactive_arr scan would help it
+		//   h  = the MOVER has a handler (m1 true) -> must full-scan regardless (no win)
+		//   cand = neighbour-arr entries walked (the scan cost) ; react = those entries that have a handler (reactive_arr size)
+	}
+	static DumpFanoutMoversProfile( reset = true ) // phase-13-fanout-01
+	{
+		let p = sdWorld.fanout_movers_profile;
+		let dt = Math.max( 0.001, ( sdWorld.time - p.start_time ) / 1000 );
+		let rows = [];
+		let tot_cand = 0, tot_cand_nh = 0, tot_react_nh = 0;
+		for ( let cls in p.by_class )
+		{
+			let b = p.by_class[ cls ];
+			let cand = b.cand_nh + b.cand_h;
+			tot_cand += cand; tot_cand_nh += b.cand_nh; tot_react_nh += b.react_nh;
+			rows.push( { cls, b, cand } );
+		}
+		rows.sort( ( a, b )=>b.cand - a.cand );
+		function pct( n, d ){ return d > 0 ? ( 100 * n / d ).toFixed( 1 ) : '0.0'; }
+
+		// Projected total scan-iteration reduction if non-handler movers read reactive_arr instead of arr (handler movers unchanged).
+		console.warn( '[FANOUT_MOVERS] ' + dt.toFixed( 1 ) + 's | scan-iters total=' + tot_cand +
+			' non-handler-mover=' + tot_cand_nh + ' (' + pct( tot_cand_nh, tot_cand ) + '% of scan)' +
+			' | projected total iter reduction=' + pct( tot_cand_nh - tot_react_nh, tot_cand ) + '%' +
+			' (over NH movers=' + pct( tot_cand_nh - tot_react_nh, tot_cand_nh ) + '%)' );
+		for ( let r = 0; r < Math.min( 15, rows.length ); r++ )
+		{
+			let x = rows[ r ], b = x.b;
+			let nh_share = pct( b.cand_nh, x.cand );
+			console.warn( '[FANOUT_MOVERS]   ' + x.cls + ' scan=' + x.cand + ' (' + pct( x.cand, tot_cand ) + '%)' +
+				' nh=' + nh_share + '% calls(nh/h)=' + b.calls_nh + '/' + b.calls_h +
+				' react/cand(nh)=' + b.react_nh + '/' + b.cand_nh + ' -> NH-cut=' + pct( b.cand_nh - b.react_nh, b.cand_nh ) + '%' );
+		}
+		if ( reset )
+		sdWorld.fanout_movers_profile = sdWorld.CreateFanoutMoversProfile();
+	}
+	// phase-13-fanout-04: build (once) the Set of receiver-class constructors proven to NO-OP against an sdSensorArea mover.
+	// Each class' onMovementInRange rejects a static / bg-layer-3 / hard_collision-false / no-velocity / non-targetable /
+	// non-gun / non-crystal mover at its entry guard (full per-class audit in lag-machine-profiling.md). ONLY non-targetable
+	// base fixtures are listed — turret-targetable enemies are intentionally excluded (they stay in the index and keep being
+	// detected via the m1/targetable direction). Lazily built so all entity classes are registered before first use.
+	static _SensorDeadReceiverClasses()
+	{
+		if ( sdWorld._sensor_dead_receiver_set === null )
+		{
+			const ec = sdWorld.entity_classes;
+			const names = [
+				'sdCable', 'sdGun', 'sdConveyor', 'sdRotator', 'sdLandMine', 'sdButton', 'sdTeleport', 'sdPortal',
+				'sdMatterAmplifier', 'sdBaseShieldingUnit', 'sdStorageTank', 'sdMatterMatrix', 'sdEssenceExtractor',
+				'sdCrystalCombiner', 'sdExcavator', 'sdMatterContainer', 'sdCraftingBench', 'sdDropPod', 'sdJunk',
+				'sdLifeBox', 'sdUpgradeStation', 'sdWeaponBench', 'sdWeaponMerger', 'sdWorkbench', 'sdSampleBuilder',
+				'sdShurgExcavator', 'sdBeamProjector', 'sdGuanakoStructure', 'sdBotCharger', 'sdBotFactory',
+				'sdFactionSpawner', 'sdLongRangeAntenna', 'sdDoor'
+			];
+			const set = new Set();
+			for ( let i = 0; i < names.length; i++ )
+			{
+				const c = ec[ names[ i ] ];
+				if ( c ) // tolerate a class missing from this build
+				set.add( c );
+			}
+			sdWorld._sensor_dead_receiver_set = set;
+		}
+		return sdWorld._sensor_dead_receiver_set;
 	}
 	// phase-13-fanout-03: Cell.sensor_relevant_arr maintenance. An entity belongs in the index iff a TURRET sensor-area mover
 	// could ever queue a movement callback for it: ( non-default onMovementInRange AND not sdBlock ) OR turret-targetable.
 	// Stable per entity (handler-ness, class, and targetable_classes never change at runtime), so add/remove stay consistent.
+	// phase-13-fanout-04: also exclude the proven-dead receiver classes (kept in lockstep with CanReactToMovement via the
+	// shared _SensorDeadReceiverClasses set) so the index drops base fixtures that never react to a moving sensor area.
 	static _SensorRelevant( e )
 	{
 		const ec = sdWorld.entity_classes;
-		if ( e.onMovementInRange !== sdEntity.prototype.onMovementInRange && e.constructor !== ec.sdBlock )
+		if ( e.onMovementInRange !== sdEntity.prototype.onMovementInRange && e.constructor !== ec.sdBlock &&
+			 !sdWorld._SensorDeadReceiverClasses().has( e.constructor ) )
 		return true;
 		let t = ec.sdTurret;
 		return ( t && t.targetable_classes ) ? t.targetable_classes.has( e.constructor ) : false;
@@ -2771,8 +3035,121 @@ class sdWorld
 		if ( reset )
 		sdWorld.sensor_verify_profile = sdWorld.CreateSensorVerifyProfile();
 	}
+	// phase-13-fanout-05: Cell.reactive_arr maintenance. A NON-handler mover (sdBlock/sdBG/sdNode/debris moving — m1 false)
+	// can only ever queue a neighbour that HAS a handler (the m2 side), so it only needs the handler subset of each cell.
+	// reactive_arr = exactly the entities with a non-default onMovementInRange. ⚠️ sdBlock STAYS in (unlike the sensor index):
+	// a SHARP/CORRUPTION block reacting to a same-bg-layer mover is a real pair, and a non-handler mover can be bg-layer 0
+	// (a block/node). Separate from sensor_relevant_arr because the sensor lane drops sdBlock+dead fixtures (would regress it).
+	static _ReactiveRelevant( e )
+	{
+		return ( e.onMovementInRange !== sdEntity.prototype.onMovementInRange );
+	}
+	static _ReactiveIndexAdd( cell, e ) // keep in lockstep with cell.arr.push (preserves arr relative order)
+	{
+		if ( sdWorld._ReactiveRelevant( e ) )
+		{
+			if ( cell.reactive_arr === null )
+			cell.reactive_arr = [];
+			cell.reactive_arr.push( e );
+		}
+	}
+	static _ReactiveIndexRemove( cell, e ) // keep in lockstep with cell.arr.splice
+	{
+		let sr = cell.reactive_arr;
+		if ( sr !== null )
+		{
+			let k = sr.indexOf( e );
+			if ( k !== -1 )
+			sr.splice( k, 1 );
+		}
+	}
+	static CreateReactiveVerifyProfile() // phase-13-fanout-05
+	{
+		return { start_time: sdWorld.time, calls:0, mismatches:0, miss_classes:Object.create( null ), full_scan:0, idx_scan:0 };
+	}
+	static DumpReactiveVerifyProfile( reset = true ) // phase-13-fanout-05
+	{
+		let p = sdWorld.reactive_verify_profile;
+		let dt = Math.max( 0.001, ( sdWorld.time - p.start_time ) / 1000 );
+		function Top( o ){ let e=[]; for ( let k in o ) e.push( k+'='+o[k] ); return e.length ? e.join( ', ' ) : '(none)'; }
+		let red = p.full_scan > 0 ? ( 100 * ( p.full_scan - p.idx_scan ) / p.full_scan ).toFixed( 1 ) : '0.0';
+		console.warn( '[REACTIVE_VERIFY] ' + dt.toFixed( 1 ) + 's non-handler moves=' + p.calls + ' mismatches=' + p.mismatches +
+			( p.mismatches > 0 ? '  MISSED(in full,not index)/EXTRA classes: ' + Top( p.miss_classes ) : '  (index byte-identical so far)' ) +
+			'  | scan full=' + p.full_scan + ' index=' + p.idx_scan + ' -> ' + red + '% fewer scanned' );
+		if ( reset )
+		sdWorld.reactive_verify_profile = sdWorld.CreateReactiveVerifyProfile();
+	}
+	static CreateFanoutDryProfile() // phase-13-fanout-02: dry-run for the two real levers (status-effect skip + sensor-area filter)
+	{
+		return {
+			start_time: sdWorld.time,
+			// (A) status-effect movers: is the fan-out provably dead? dispatches should be ~0 to skip safely.
+			sfx: { calls:0, moves_with_dispatch:0, dispatches:0, by_neighbour:Object.create( null ) },
+			// (B) sensor-area movers, split by their on_movement_target class (turret=targetable-filterable,
+			//     antigravity=reacts-to-ALL=not filterable, door=team). cand=neighbours walked, relevant=map.add (would-react).
+			sensor: { by_target: Object.create( null ) }
+		};
+	}
+	static DumpFanoutDryProfile( reset = true ) // phase-13-fanout-02
+	{
+		let p = sdWorld.fanout_dry_profile;
+		let dt = Math.max( 0.001, ( sdWorld.time - p.start_time ) / 1000 );
+		function pct( n, d ){ return d > 0 ? ( 100 * n / d ).toFixed( 1 ) : '0.0'; }
+		function Top( obj ){ let e=[]; for ( let k in obj ) e.push( k+'='+obj[k] ); return e.length ? e.join( ', ' ) : '(none)'; }
+
+		// (A)
+		console.warn( '[FANOUT_DRY] ' + dt.toFixed( 1 ) + 's | (A) sdStatusEffect movers: calls=' + p.sfx.calls +
+			' moves_with_dispatch=' + p.sfx.moves_with_dispatch + ' total_dispatches=' + p.sfx.dispatches +
+			'  => ' + ( p.sfx.dispatches === 0 ? 'SKIP IS SAFE (0 dispatches)' : 'NOT trivially skippable' ) );
+		if ( p.sfx.dispatches > 0 )
+		console.warn( '[FANOUT_DRY]   (A) dispatch neighbour classes: ' + Top( p.sfx.by_neighbour ) );
+
+		// (B)
+		console.warn( '[FANOUT_DRY] (B) sdSensorArea movers by target:' );
+		let tk = Object.keys( p.sensor.by_target ).sort( ( a, b )=>p.sensor.by_target[ b ].cand - p.sensor.by_target[ a ].cand );
+		for ( let i = 0; i < tk.length; i++ )
+		{
+			let t = p.sensor.by_target[ tk[ i ] ];
+			console.warn( '[FANOUT_DRY]   target=' + tk[ i ] + ' calls=' + t.calls + ' cand=' + t.cand +
+				' relevant=' + t.relevant + ' (relevant=' + pct( t.relevant, t.cand ) + '% of scan)' +
+				' -> skippable=' + pct( t.cand - t.relevant, t.cand ) + '%' );
+		}
+
+		if ( reset )
+		sdWorld.fanout_dry_profile = sdWorld.CreateFanoutDryProfile();
+	}
 	static UpdateHashPosition( entity, delay_callback_calls, allow_calling_movement_in_range=true ) // allow_calling_movement_in_range better be false when it is not decided whether entity will be physically placed in world or won't be (so sdBlock SHARP won't kill initiator in the middle of Shoot method of a gun, which was causing crash)
 	{
+		// phase-7-los-02: any entity entering/leaving/moving within the collision hash invalidates
+		// the same-tick LOS cache. This is the only place hash-cell membership/positions change
+		// (spawn/move/remove all funnel through here), so bumping here is sufficient and exact.
+		sdWorld._los_cache_epoch++;
+
+		const PROF = globalThis.DEBUG_MOVEMENT_CALLBACK_PROFILE ? sdWorld.movement_callback_profile : null; // phase-13-lagmachine-03
+		if ( PROF )
+		{
+			PROF.update_hash_calls++;
+			if ( sdWorld.time - PROF.start_time >= 5000 )
+			sdWorld.DumpMovementCallbackProfile( true );
+		}
+
+		const ST = globalThis.DEBUG_UPDATEHASH_SELFTIME ? sdWorld.updatehash_selftime_profile : null; // phase-13-updatehash-08
+		if ( ST )
+		{
+			ST.calls++;
+			if ( sdWorld.time - ST.start_time >= 5000 ) // auto-print at most every 5s; resets the bucket
+			sdWorld.DumpUpdateHashSelfTimeProfile( true );
+		}
+		let _t = 0; // phase-13-updatehash-08: per-phase performance.now() start marker (only read/written when ST is set)
+
+		const FM = globalThis.DEBUG_FANOUT_MOVERS ? sdWorld.fanout_movers_profile : null; // phase-13-fanout-01
+		if ( FM && sdWorld.time - FM.start_time >= 5000 )
+		sdWorld.DumpFanoutMoversProfile( true );
+
+		const DRY = globalThis.DEBUG_FANOUT_DRY ? sdWorld.fanout_dry_profile : null; // phase-13-fanout-02
+		if ( DRY && sdWorld.time - DRY.start_time >= 5000 )
+		sdWorld.DumpFanoutDryProfile( true );
+
 		if ( sdWorld.is_server )
 		//if ( entity.IsGlobalEntity() )
 		if ( entity.is( sdWeather ) )
@@ -2780,8 +3157,10 @@ class sdWorld
 			debugger;
 		}
 		
+		if ( ST ) _t = performance.now();
 		if ( !delay_callback_calls )
 		entity.UpdateHitbox();
+		if ( ST ) ST.hitbox_ms += performance.now() - _t;
 	
 		//let new_hash_position = entity._is_being_removed ? null : sdWorld.RequireHashPosition( entity.x, entity.y );
 		
@@ -2789,6 +3168,7 @@ class sdWorld
 		//debugger;
 		
 		
+		if ( ST ) _t = performance.now();
 		let new_affected_hash_arrays = [];
 		if ( !entity._is_being_removed && !delay_callback_calls ) // delay_callback_calls is useful here as it will delay ._hitbox_x2 access which in case of sdBlock will be undefined at the very beginning, due to .width not specified yet
 		{
@@ -2841,8 +3221,16 @@ class sdWorld
 		}
 		
 		//if ( entity._hash_position !== new_hash_position )
-		if ( !sdWorld.ArraysEqualIgnoringOrder( entity._affected_hash_arrays, new_affected_hash_arrays ) )
+		if ( ST ) ST.cell_list_ms += performance.now() - _t;
+
+		// phase-13-updatehash-08: hoist the (pure) comparison out of the if-condition only to time it; logic is unchanged.
+		if ( ST ) _t = performance.now();
+		let _hash_changed = !sdWorld.ArraysEqualIgnoringOrder( entity._affected_hash_arrays, new_affected_hash_arrays );
+		if ( ST ) ST.equality_ms += performance.now() - _t;
+		if ( _hash_changed )
 		{
+			sdWorld._rigid_membership_seq++; // phase-13-rigid-05: real hash-membership change -> invalidate any in-flight rigid reactive cache
+			if ( ST ) _t = performance.now();
 			for ( var i = 0; i < entity._affected_hash_arrays.length; i++ )
 			{
 				var ind = entity._affected_hash_arrays[ i ].arr.indexOf( entity );
@@ -2851,8 +3239,9 @@ class sdWorld
 			
 				entity._affected_hash_arrays[ i ].arr.splice( ind, 1 );
 				sdWorld._SensorIndexRemove( entity._affected_hash_arrays[ i ], entity ); // phase-13-fanout-03
+				sdWorld._ReactiveIndexRemove( entity._affected_hash_arrays[ i ], entity ); // phase-13-fanout-05
 				//entity._affected_hash_arrays[ i ].RecreateWithout( ind );
-					
+
 				if ( entity._affected_hash_arrays[ i ].arr.length === 0 && new_affected_hash_arrays.indexOf( entity._affected_hash_arrays[ i ] ) === -1 ) // Empty and not going to re-add(!)
 				{
 					//entity._affected_hash_arrays[ i ].unlinked = globalThis.getStackTrace();
@@ -2873,6 +3262,8 @@ class sdWorld
 				}
 			}*/
 			
+			if ( ST ) ST.old_remove_ms += performance.now() - _t;
+			if ( ST ) _t = performance.now();
 			for ( var i = 0; i < new_affected_hash_arrays.length; i++ )
 			{
 				let arr = new_affected_hash_arrays[ i ].arr;
@@ -2922,11 +3313,13 @@ class sdWorld
 				//new_affected_hash_arrays[ i ].push( entity );
 				arr.push( entity );
 				sdWorld._SensorIndexAdd( new_affected_hash_arrays[ i ], entity ); // phase-13-fanout-03
+				sdWorld._ReactiveIndexAdd( new_affected_hash_arrays[ i ], entity ); // phase-13-fanout-05
 				//new_affected_hash_arrays[ i ].RecreateWith( entity );
-				
+
 				if ( arr.length > 1000 ) // Dealing with NaN bounds?
 				debugger;
 			}
+			if ( ST ) ST.new_push_ms += performance.now() - _t;
 			
 /*
 			if ( entity.GetClass() === 'sdArea' )
@@ -2959,7 +3352,19 @@ class sdWorld
 			//if ( false ) // Is it still needed? Yes, for cases of overlap that does not involve pushing (players picking up guns, bullets hitting anything)
 			//if ( sdWorld.is_server || entity._net_id !== undefined ) // Not a client-side entity, these (like sdBone) should not react with anything and can simply take up execution time
 			{
+				if ( ST ) _t = performance.now();
 				let map = new Set();
+
+				let fm_cand = 0, fm_react = 0; // phase-13-fanout-01 (only tallied when FM!==null)
+
+				// phase-13-fanout-02 dry locals (only used when DRY!==null)
+				let dry_is_sfx = false, dry_is_sensor = false, dry_cand = 0, dry_relevant = 0;
+				if ( DRY )
+				{
+					let mc = entity.GetClass();
+					dry_is_sfx = ( mc === 'sdStatusEffect' );
+					dry_is_sensor = ( mc === 'sdSensorArea' );
+				}
 
 				let i2, i;
 
@@ -2987,6 +3392,13 @@ class sdWorld
 				}
 				let sensor_on = ( SSM === 'on' && is_turret_sensor );
 
+				// phase-13-fanout-05: is THIS mover a NON-handler (block/BG/node/debris)? It can only ever queue a handler
+				// neighbour, so it needs only Cell.reactive_arr. REACTIVE_SCAN_MODE off/'verify'/'on' mirrors SENSOR_SCAN_MODE.
+				// Mutually exclusive with sensor_on (a turret-sensor mover IS a handler), so the two never both apply.
+				const RSM = globalThis.REACTIVE_SCAN_MODE;
+				let mover_is_nonhandler = ( entity.onMovementInRange === default_movement_in_range_method );
+				let reactive_on = ( RSM === 'on' && mover_is_nonhandler && !sensor_on );
+
 				for ( i2 = 0; i2 < new_affected_hash_arrays.length; i2++ )
 				{
 					let scan_src = new_affected_hash_arrays[ i2 ].arr; // phase-13-fanout-03
@@ -2996,29 +3408,87 @@ class sdWorld
 						if ( scan_src === null )
 						continue;
 					}
+					else if ( reactive_on ) // phase-13-fanout-05
+					{
+						scan_src = new_affected_hash_arrays[ i2 ].reactive_arr;
+						if ( scan_src === null )
+						continue;
+					}
 					for ( i = 0; i < scan_src.length; i++ )
 					{
 						another_entity = scan_src[ i ];
+
+					if ( FM ) fm_cand++; // phase-13-fanout-01: every neighbour-arr entry walked = the scan cost the reactive index would cut
+					if ( DRY && ( dry_is_sfx || dry_is_sensor ) ) dry_cand++; // phase-13-fanout-02
 
 					if ( another_entity !== entity )
 					{
 						let m1 = ( entity.onMovementInRange !== default_movement_in_range_method );
 						let m2 = ( another_entity.onMovementInRange !== default_movement_in_range_method );
 
+						if ( FM && m2 ) fm_react++; // phase-13-fanout-01: this neighbour has a handler -> would be in Cell.reactive_arr
+
+						let same_rigid = false; // phase-13-lagmachine-03
+						if ( PROF )
+						{
+							PROF.candidate_pairs++;
+							if ( m1 || m2 )
+							PROF.handler_pairs++;
+							const RIGID = sdWorld.current_rigid_move_context;
+							if ( RIGID && RIGID.set.has( entity ) && RIGID.set.has( another_entity ) )
+							{
+								same_rigid = true;
+								PROF.same_rigid_move_candidate_pairs++;
+							}
+						}
+
 						if ( m1 || m2 )
 						if ( entity.x + entity._hitbox_x2 > another_entity.x + another_entity._hitbox_x1 &&
 							 entity.x + entity._hitbox_x1 < another_entity.x + another_entity._hitbox_x2 &&
 							 entity.y + entity._hitbox_y2 > another_entity.y + another_entity._hitbox_y1 &&
 							 entity.y + entity._hitbox_y1 < another_entity.y + another_entity._hitbox_y2 )
-						// Reaction filter: m1/m2 already prove which side has a non-default onMovementInRange (== CanReactToMovement's first
-						// guard), so skip the predicate call for a handler-less side and short-circuit once one side is proven reactive.
-						// Equivalent to CanReactToMovement( entity, another ) || CanReactToMovement( another, entity ); skips proven no-op pairs.
-						if ( ( m1 && sdWorld.CanReactToMovement( entity, another_entity ) ) ||
-							 ( m2 && sdWorld.CanReactToMovement( another_entity, entity ) ) )
-						map.add( another_entity );
+						{
+							// phase-13-updatehash-06: live reaction filter. Only queue the callback pair if at least one
+							// side could actually react; otherwise it is a proven no-op (phase-13-updatehash-04 audit) and is skipped.
+							// phase-13-updatehash-08: m1/m2 already encode whether each side has a non-default onMovementInRange,
+							// which is exactly CanReactToMovement's first guard (it returns false for a default handler). So skip the
+							// predicate call for a side without a handler (it would return false anyway) and short-circuit once one side
+							// is proven reactive. Result is identical to ( CanReact(a,b) || CanReact(b,a) ), just with fewer calls.
+							if ( ( m1 && sdWorld.CanReactToMovement( entity, another_entity ) ) ||
+								 ( m2 && sdWorld.CanReactToMovement( another_entity, entity ) ) )
+							{
+								map.add( another_entity );
+
+								if ( DRY && ( dry_is_sfx || dry_is_sensor ) ) // phase-13-fanout-02: this neighbour would actually be dispatched to
+								{
+									dry_relevant++;
+									if ( dry_is_sfx )
+									{
+										let nc = another_entity.GetClass();
+										DRY.sfx.by_neighbour[ nc ] = ( DRY.sfx.by_neighbour[ nc ] || 0 ) + 1;
+									}
+								}
+
+								if ( PROF )
+								{
+									PROF.map_added_pairs++;
+									if ( same_rigid )
+									PROF.same_rigid_move_map_added_pairs++;
+									let key = entity.GetClass() + ' -> ' + another_entity.GetClass();
+									PROF.added_class_pairs[ key ] = ( PROF.added_class_pairs[ key ] || 0 ) + 1;
+								}
+							}
+							else if ( PROF )
+							{
+								let key = entity.GetClass() + ' -> ' + another_entity.GetClass();
+								PROF.would_skip_pairs++;
+								PROF.would_skip_callbacks += ( m1 ? 1 : 0 ) + ( m2 ? 1 : 0 );
+								PROF.would_skip_class_pairs[ key ] = ( PROF.would_skip_class_pairs[ key ] || 0 ) + 1;
+							}
+						}
 					}
+					} // phase-13-fanout-03: close the per-cell outer loop (paired with the scan-source switch above)
 				}
-				} // phase-13-fanout-03: close the per-cell outer loop (paired with the scan-source switch above)
 
 				if ( SSM === 'verify' && is_turret_sensor ) // phase-13-fanout-03: shadow-compare index scan vs the full-scan map just built
 				{
@@ -3052,13 +3522,78 @@ class sdWorld
 					sdWorld.DumpSensorVerifyProfile( true );
 				}
 
+				if ( RSM === 'verify' && mover_is_nonhandler && !sensor_on ) // phase-13-fanout-05: shadow-compare reactive-index scan vs the full-scan map just built
+				{
+					let vp = sdWorld.reactive_verify_profile;
+					vp.calls++;
+					let idx_set = new Set();
+					for ( let vi2 = 0; vi2 < new_affected_hash_arrays.length; vi2++ )
+					{
+						vp.full_scan += new_affected_hash_arrays[ vi2 ].arr.length; // measure the win: full-arr vs index scan size
+						let vsr = new_affected_hash_arrays[ vi2 ].reactive_arr;
+						if ( vsr === null )
+						continue;
+						vp.idx_scan += vsr.length;
+						for ( let vi = 0; vi < vsr.length; vi++ )
+						{
+							let A = vsr[ vi ];
+							if ( A === entity )
+							continue;
+							// mover is non-handler (m1 false) -> only the m2 side can queue; A is always a handler here (reactive_arr)
+							if ( entity.x + entity._hitbox_x2 > A.x + A._hitbox_x1 &&
+								 entity.x + entity._hitbox_x1 < A.x + A._hitbox_x2 &&
+								 entity.y + entity._hitbox_y2 > A.y + A._hitbox_y1 &&
+								 entity.y + entity._hitbox_y1 < A.y + A._hitbox_y2 )
+							if ( sdWorld.CanReactToMovement( A, entity ) )
+							idx_set.add( A );
+						}
+					}
+					map.forEach( ( A )=>{ if ( !idx_set.has( A ) ) { vp.mismatches++; let c = A.GetClass(); vp.miss_classes[ c ] = ( vp.miss_classes[ c ] || 0 ) + 1; } } );
+					idx_set.forEach( ( A )=>{ if ( !map.has( A ) ) { vp.mismatches++; let c = 'EXTRA:' + A.GetClass(); vp.miss_classes[ c ] = ( vp.miss_classes[ c ] || 0 ) + 1; } } );
+					if ( sdWorld.time - vp.start_time >= 5000 )
+					sdWorld.DumpReactiveVerifyProfile( true );
+				}
+
+				if ( FM ) // phase-13-fanout-01: tally this mover's scan cost into its class bucket, split by whether the mover itself has a handler
+				{
+					let mover_has_handler = ( entity.onMovementInRange !== default_movement_in_range_method );
+					let cls = entity.GetClass();
+					let b = FM.by_class[ cls ];
+					if ( b === undefined )
+					b = FM.by_class[ cls ] = { calls_nh:0, calls_h:0, cand_nh:0, cand_h:0, react_nh:0, react_h:0 };
+					if ( mover_has_handler ) { b.calls_h++; b.cand_h += fm_cand; b.react_h += fm_react; }
+					else { b.calls_nh++; b.cand_nh += fm_cand; b.react_nh += fm_react; }
+				}
+
+				if ( DRY ) // phase-13-fanout-02 tally
+				{
+					if ( dry_is_sfx )
+					{
+						DRY.sfx.calls++;
+						DRY.sfx.dispatches += dry_relevant;
+						if ( dry_relevant > 0 ) DRY.sfx.moves_with_dispatch++;
+					}
+					else if ( dry_is_sensor )
+					{
+						let tcls = entity.on_movement_target ? entity.on_movement_target.GetClass() : 'none';
+						let t = DRY.sensor.by_target[ tcls ];
+						if ( t === undefined ) t = DRY.sensor.by_target[ tcls ] = { calls:0, cand:0, relevant:0 };
+						t.calls++; t.cand += dry_cand; t.relevant += dry_relevant;
+					}
+				}
 
 				// Always call onMovementInRange with last interacted water as it might not receive onMovementInRange as it is only called whenever something enters water, not when it leaves it
 				let water = sdWater.all_swimmers.get( entity );
 				if ( water )
-				map.add( water );
+				{
+					map.add( water );
+					if ( PROF ) // phase-13-lagmachine-03
+					PROF.water_forced_pairs++;
+				}
 
 				// Make entities reach to each other in both directions
+				if ( ST ) ST.callback_scan_ms += performance.now() - _t;
+				if ( ST ) _t = performance.now();
 				map.forEach( ( another_entity )=>
 				{
 					//if ( another_entity !== entity )
@@ -3077,16 +3612,247 @@ class sdWorld
 								let m2 = ( another_entity.onMovementInRange !== default_movement_in_range_method );
 
 								if ( m1 )
-								entity.onMovementInRange( another_entity );
+								{
+									entity.onMovementInRange( another_entity );
+									if ( PROF ) // phase-13-lagmachine-03: callee <- from
+									{
+										PROF.callback_calls++;
+										let key = entity.GetClass() + ' <- ' + another_entity.GetClass();
+										PROF.callback_class_pairs[ key ] = ( PROF.callback_class_pairs[ key ] || 0 ) + 1;
+									}
+								}
 
 								if ( m2 )
-								another_entity.onMovementInRange( entity );
+								{
+									another_entity.onMovementInRange( entity );
+									if ( PROF ) // phase-13-lagmachine-03: callee <- from
+									{
+										PROF.callback_calls++;
+										let key = another_entity.GetClass() + ' <- ' + entity.GetClass();
+										PROF.callback_class_pairs[ key ] = ( PROF.callback_class_pairs[ key ] || 0 ) + 1;
+									}
+								}
 							//}
 						}
 					//}
 				});
+				if ( ST ) ST.callback_invoke_ms += performance.now() - _t;
 			}
 		}
+	}
+	// ================================================================================================================
+	// phase-13-rigid-05 (2026-06-20): authoritative rigid-group move fast path (rigid-move-design.md §6), used ONLY by
+	// sdSteeringWheel.ComplexElevatorLikeMove when globalThis.RIGID_MOVE_MODE === 'on'. A steering-wheel move translates
+	// a whole base rigidly; legacy code treats it as hundreds of independent entity moves, each of which (a) rehashes its
+	// own cells and (b) re-scans all of its cells for movement-callback neighbours. (b) was ~87% of UpdateHashPosition
+	// self-time on the live slot-1003 base (the dense base-interior cells get re-iterated once per member). These helpers
+	// rehash the whole group in two stages and scan each shared cell ONCE, producing the SAME world_hash_positions
+	// membership and the SAME onMovementInRange invocation multiset+order as the legacy per-member path. All members must
+	// already be at their FINAL x/y (the steering commit loops move them) before these run.
+
+	static RigidComputeNewCells( entity ) // mirror of the cell-list math in UpdateHashPosition (cells the hitbox overlaps)
+	{
+		let cells = [];
+		if ( entity._is_being_removed || entity._net_id === undefined )
+		return cells;
+
+		let from_x = sdWorld.FastFloor( ( entity.x + entity._hitbox_x1 ) * CHUNK_SIZE_INV );
+		let from_y = sdWorld.FastFloor( ( entity.y + entity._hitbox_y1 ) * CHUNK_SIZE_INV );
+		let to_x = sdWorld.FastCeil( ( entity.x + entity._hitbox_x2 ) * CHUNK_SIZE_INV );
+		let to_y = sdWorld.FastCeil( ( entity.y + entity._hitbox_y2 ) * CHUNK_SIZE_INV );
+
+		if ( to_x === from_x )
+		to_x++;
+		if ( to_y === from_y )
+		to_y++;
+
+		if ( ( to_x - from_x < CHUNK_SIZE && to_y - from_y < CHUNK_SIZE ) || entity.is( sdDeepSleep ) )
+		{
+			for ( let cx = from_x; cx < to_x; cx++ )
+			for ( let cy = from_y; cy < to_y; cy++ )
+			cells.push( sdWorld.RequireHashPosition( cx * CHUNK_SIZE, cy * CHUNK_SIZE, true ) );
+		}
+		else
+		debugger; // ~~ operation overflow / object too huge (matches legacy UpdateHashPosition guard)
+
+		return cells;
+	}
+
+	// §6a — two-stage batched rehash. Equivalent to calling UpdateHashPosition( m, false, false ) for every member IN THE
+	// GIVEN ORDER, but removes all members from their old cells first and only then adds them to their new cells, so a cell
+	// emptied by member A and refilled by member B never gets deleted-and-recreated (the churn). Skip-if-unchanged is kept
+	// per member so a member whose cells did not move keeps its exact position inside each cell's arr (legacy arr order is
+	// preserved -> future scans / Set-insertion order stay byte-identical). NOTE: the deepsleep-stuck DEBUG diagnostic in
+	// UpdateHashPosition (gated by sdDeepSleep.debug_track_entity_stucking..., off in production) is intentionally not
+	// replicated here; it has no behavioural effect.
+	static UpdateHashPositionBatchRigid( members )
+	{
+		sdWorld._los_cache_epoch++;        // membership about to change -> invalidate same-tick LOS cache (as UpdateHashPosition does)
+
+		// Stage 0: refresh hitboxes + compute each member's new cells; collect the ones whose cells actually moved.
+		// NOTE: game entities are Object.seal'd (non-extensible) so we CANNOT stash scratch state on the member —
+		// the changed members + their new cells are held in two parallel local arrays.
+		let changed_m = [];
+		let changed_nc = [];
+		for ( let i = 0; i < members.length; i++ )
+		{
+			let m = members[ i ];
+			m.UpdateHitbox();
+			let nc = sdWorld.RigidComputeNewCells( m );
+			if ( !sdWorld.ArraysEqualIgnoringOrder( m._affected_hash_arrays, nc ) ) // unchanged -> do not touch the hash for this member
+			{
+				changed_m.push( m );
+				changed_nc.push( nc );
+			}
+		}
+
+		if ( changed_m.length === 0 )
+		return; // nothing moved cells (rare for a real move, but cheap to short-circuit)
+
+		// Stage 1: remove every changed member from its OLD cells. Defer empty-cell deletion (a cell emptied here may be
+		// refilled in stage 2 by another member; deleting+recreating it would churn world_hash_positions for nothing).
+		let maybe_empty = [];
+		for ( let i = 0; i < changed_m.length; i++ )
+		{
+			let m = changed_m[ i ];
+			let old = m._affected_hash_arrays;
+			for ( let j = 0; j < old.length; j++ )
+			{
+				let cell = old[ j ];
+				let ind = cell.arr.indexOf( m );
+				if ( ind === -1 )
+				throw new Error( 'Bad hash object - rigid batch: member missing from one of its old cells' );
+				cell.arr.splice( ind, 1 );
+				sdWorld._SensorIndexRemove( cell, m ); // phase-13-fanout-03
+				sdWorld._ReactiveIndexRemove( cell, m ); // phase-13-fanout-05
+				maybe_empty.push( cell );
+			}
+		}
+
+		// Stage 2: add every changed member to its NEW cells, in member order (matches legacy append order), then commit.
+		for ( let i = 0; i < changed_m.length; i++ )
+		{
+			let m = changed_m[ i ];
+			let nc = changed_nc[ i ];
+			for ( let j = 0; j < nc.length; j++ )
+			{
+				nc[ j ].arr.push( m );
+				sdWorld._SensorIndexAdd( nc[ j ], m ); // phase-13-fanout-03
+				sdWorld._ReactiveIndexAdd( nc[ j ], m ); // phase-13-fanout-05
+				if ( nc[ j ].arr.length > 1000 ) // legacy NaN-bounds guard
+				debugger;
+			}
+			m._affected_hash_arrays = nc; // pre-existing property -> safe to assign on a sealed entity
+		}
+
+		// Stage 3: delete any old cell that ended up genuinely empty (no member or external re-added). Safe now all adds ran.
+		for ( let i = 0; i < maybe_empty.length; i++ )
+		{
+			let cell = maybe_empty[ i ];
+			if ( cell.arr.length === 0 )
+			sdWorld.world_hash_positions.delete( cell.hash );
+		}
+
+		sdWorld._rigid_membership_seq++; // real membership change (matches the per-member bump UpdateHashPosition would have done)
+	}
+
+	// §6b helper — scan the union of the group's final cells ONCE and record, per cell, the entities that actually have a
+	// movement-callback handler (onMovementInRange overridden). Shared dense cells are visited a single time (the win).
+	// Returns Map<Cell, Entity[]|null>; null entry = cell scanned, no reactive occupants (the common case for base hull).
+	static BuildRigidReactiveCache( members )
+	{
+		const default_handler = sdEntity.prototype.onMovementInRange;
+		let cache = new Map();
+		for ( let i = 0; i < members.length; i++ )
+		{
+			let cells = members[ i ]._affected_hash_arrays;
+			for ( let j = 0; j < cells.length; j++ )
+			{
+				let cell = cells[ j ];
+				if ( cache.has( cell ) )
+				continue; // already scanned (shared cell) -> scan-each-cell-once
+				let arr = cell.arr;
+				let reactive = null;
+				for ( let k = 0; k < arr.length; k++ )
+				if ( arr[ k ].onMovementInRange !== default_handler )
+				{
+					if ( reactive === null )
+					reactive = [];
+					reactive.push( arr[ k ] );
+				}
+				cache.set( cell, reactive );
+			}
+		}
+		return cache;
+	}
+
+	// §6b — per-member movement-callback fan-out, byte-identical to the allow_calling_movement_in_range=true branch of
+	// UpdateHashPosition for a member whose hash membership is ALREADY final (set by the batch above). For a member with a
+	// default onMovementInRange (the rigid mass: blocks/BG/nodes) the legacy queue condition reduces to
+	// `another_has_handler && CanReactToMovement( another, member )`, so only a cell's reactive occupants can ever be
+	// queued -> iterate just those (from the cache), giving an identical Set (membership AND order, since the cache
+	// preserves arr order) with far fewer iterations. A member that DOES have a handler must still see every neighbour, so
+	// it scans the full cell. cache_seq pins the cache to the membership state at build time; if a prior callback changed
+	// hash membership (seq advanced) the cache may be stale, so this member falls back to the full per-cell scan (= legacy).
+	static RigidMemberCallbacks( entity, reactive_cache, cache_seq )
+	{
+		if ( entity._is_being_removed )
+		return;
+
+		entity._last_x = entity.x;
+		entity._last_y = entity.y;
+
+		const default_handler = sdEntity.prototype.onMovementInRange;
+		let m1 = ( entity.onMovementInRange !== default_handler );
+		let cache_ok = ( sdWorld._rigid_membership_seq === cache_seq );
+		let cells = entity._affected_hash_arrays;
+		let map = new Set();
+
+		for ( let i2 = 0; i2 < cells.length; i2++ )
+		{
+			let cell = cells[ i2 ];
+			let list = ( m1 || !cache_ok ) ? cell.arr : reactive_cache.get( cell );
+			if ( !list )
+			continue;
+			for ( let i = 0; i < list.length; i++ )
+			{
+				let another_entity = list[ i ];
+				if ( another_entity !== entity )
+				{
+					let m2 = ( another_entity.onMovementInRange !== default_handler );
+					if ( m1 || m2 )
+					if ( entity.x + entity._hitbox_x2 > another_entity.x + another_entity._hitbox_x1 &&
+						 entity.x + entity._hitbox_x1 < another_entity.x + another_entity._hitbox_x2 &&
+						 entity.y + entity._hitbox_y2 > another_entity.y + another_entity._hitbox_y1 &&
+						 entity.y + entity._hitbox_y1 < another_entity.y + another_entity._hitbox_y2 )
+					{
+						if ( ( m1 && sdWorld.CanReactToMovement( entity, another_entity ) ) ||
+							 ( m2 && sdWorld.CanReactToMovement( another_entity, entity ) ) )
+						map.add( another_entity );
+					}
+				}
+			}
+		}
+
+		let water = sdWater.all_swimmers.get( entity );
+		if ( water )
+		map.add( water );
+
+		map.forEach( ( another_entity )=>
+		{
+			if ( !another_entity._is_being_removed )
+			if ( !entity._is_being_removed )
+			{
+				let mm1 = ( entity.onMovementInRange !== default_handler );
+				let mm2 = ( another_entity.onMovementInRange !== default_handler );
+
+				if ( mm1 )
+				entity.onMovementInRange( another_entity );
+
+				if ( mm2 )
+				another_entity.onMovementInRange( entity );
+			}
+		});
 	}
     static GetTimeWarpSpeedForEntity( e )  // Anything distance/range base is better to handle with sdSensorArea-s, even crystal glow probably
     {
@@ -4048,6 +4814,33 @@ class sdWorld
 	}
 	static CheckLineOfSight( x1, y1, x2, y2, ignore_entity=null, ignore_entity_class_name_strings_array=null, include_only_specific_class_name_strings_array=null, custom_filtering_method=null ) // sdWorld.last_hit_entity will be set if false, but not if world edge was met. custom_filtering_method is executed before hit detection
 	{
+		// phase-7-los-02: same-tick LOS reuse. Only cache filter-less calls (a custom_filtering_method
+		// may inspect mutable per-call state, so it is never cached). Validity is keyed on the hash
+		// epoch bumped by UpdateHashPosition, making a hit bit-identical to a recompute.
+		const los_cache_on = ( custom_filtering_method === null && !globalThis.DISABLE_LOS_CACHE );
+		if ( los_cache_on )
+		{
+			const slots = sdWorld._los_cache_slots;
+			const epoch = sdWorld._los_cache_epoch;
+			for ( let k = 0; k < slots.length; k++ )
+			{
+				const sl = slots[ k ];
+				if ( sl.epoch === epoch &&
+					 sl.x1 === x1 && sl.y1 === y1 && sl.x2 === x2 && sl.y2 === y2 &&
+					 sl.ignore === ignore_entity &&
+					 sl.inc === include_only_specific_class_name_strings_array &&
+					 sl.ign === ignore_entity_class_name_strings_array )
+				{
+					sdWorld.last_hit_entity = sl.hit_entity; // reproduce post-call side effect
+					if ( globalThis.DEBUG_LOS_CACHE )
+					sdWorld._los_cache_hits++;
+					return sl.result;
+				}
+			}
+			if ( globalThis.DEBUG_LOS_CACHE )
+			sdWorld._los_cache_misses++;
+		}
+
 		if ( globalThis.DEBUG_LOS_ATTRIBUTION ) { sdWorld.DebugCountLOS( 'CheckLineOfSight', ignore_entity ); sdWorld._los_internal = true; } // Phase 7 probe: mark internal CheckWallExists stepping calls so they attribute separately from direct ones
 
 		let r1 = true;
@@ -4069,6 +4862,20 @@ class sdWorld
 		}
 
 		if ( globalThis.DEBUG_LOS_ATTRIBUTION ) sdWorld._los_internal = false;
+		if ( los_cache_on )
+		{
+			const w = sdWorld._los_cache_write;
+			const sl = sdWorld._los_cache_slots[ w ];
+			sl.epoch = sdWorld._los_cache_epoch;
+			sl.x1 = x1; sl.y1 = y1; sl.x2 = x2; sl.y2 = y2;
+			sl.ignore = ignore_entity;
+			sl.inc = include_only_specific_class_name_strings_array;
+			sl.ign = ignore_entity_class_name_strings_array;
+			sl.result = r1;
+			sl.hit_entity = sdWorld.last_hit_entity;
+			sdWorld._los_cache_write = ( w + 1 ) % sdWorld._los_cache_slots.length;
+		}
+
 
 		return r1;
 		
@@ -6396,8 +7203,12 @@ class Cell
 		// movement callback for = ( has a non-default onMovementInRange AND is not sdBlock ) OR is in sdTurret.targetable_classes.
 		// (sdBlock is provably excluded: sensor areas are bg-layer 3, blocks never are, so CanReactToMovement(block,sensorArea)
 		// is always false.) Lazy-null until the first relevant entity is added (most base-hull cells stay null = no alloc).
-		// Maintained in sync with arr at the 2 membership-mutation sites in UpdateHashPosition. Read ONLY by turret-sensor movers.
+		// Maintained in sync with arr at the only 4 membership-mutation sites. Read ONLY by turret-sensor movers.
 		this.sensor_relevant_arr = null;
+		// phase-13-fanout-05: secondary index = the subset of arr with a non-default onMovementInRange (ALL handlers, incl
+		// sdBlock). Read ONLY by non-handler movers (which can only queue a handler neighbour). Lazy-null; maintained in sync
+		// with arr at the same 4 membership-mutation sites as sensor_relevant_arr.
+		this.reactive_arr = null;
 
 		//this.snapshot_scan_id = 0; // Used during snapshot scan to keep track of visited cells
 
